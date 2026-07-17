@@ -1,5 +1,6 @@
 //! Example: MQTT server with a QUIC (UDP) transport listener on port 9443.
-//! Demonstrates how to configure TLS certificates for QUIC connections.
+//! Demonstrates TLS certificates and explicitly enables replay-sensitive QUIC 0-RTT for the
+//! companion `simple_quic_client` example.
 
 use rmqtt::{context::ServerContext, net::Builder, server::MqttServer, Result};
 use simple_logger::SimpleLogger;
@@ -17,6 +18,7 @@ async fn main() -> Result<()> {
                 .laddr(([0, 0, 0, 0], 9443).into())
                 .tls_key(Some("./rmqtt-bin/rmqtt.key"))
                 .tls_cert(Some("./rmqtt-bin/rmqtt.pem"))
+                .enable_quic_0rtt(true)
                 .bind_quic()?,
         )
         .build()

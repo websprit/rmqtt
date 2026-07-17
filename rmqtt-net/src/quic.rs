@@ -19,13 +19,20 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 pub struct QuinnBiStream {
     send: SendStream,
     recv: RecvStream,
+    is_0rtt: bool,
 }
 
 impl QuinnBiStream {
     /// Creates a new `QuinnBiStream` from Quinn send and receive stream halves
     #[allow(dead_code)]
     pub fn new(send: SendStream, recv: RecvStream) -> Self {
-        Self { send, recv }
+        let is_0rtt = recv.is_0rtt();
+        Self { send, recv, is_0rtt }
+    }
+
+    /// Returns whether this stream was opened using QUIC 0-RTT data.
+    pub fn is_0rtt(&self) -> bool {
+        self.is_0rtt
     }
 }
 

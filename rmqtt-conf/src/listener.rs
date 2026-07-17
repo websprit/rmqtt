@@ -302,6 +302,9 @@ pub struct ListenerInner {
     //QUIC max_idle_timeout
     #[serde(default = "ListenerInner::idle_timeout_default", deserialize_with = "deserialize_duration")]
     pub idle_timeout: Duration,
+    /// Enables receiving MQTT CONNECT during resumed QUIC handshakes.
+    #[serde(default)]
+    pub enable_0rtt: bool,
 }
 
 impl Default for ListenerInner {
@@ -350,6 +353,7 @@ impl Default for ListenerInner {
             cert_subject_dn_as_username: false,
             collect_cert_info: false,
             idle_timeout: ListenerInner::idle_timeout_default(),
+            enable_0rtt: false,
         }
     }
 }
@@ -536,5 +540,26 @@ impl ListenerInner {
     #[inline]
     fn idle_timeout_default() -> Duration {
         Duration::from_secs(90)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ListenerInner;
+
+    #[test]
+    fn quic_0rtt_is_disabled_by_default() {
+        assert!(!ListenerInner::default().enable_0rtt);
+    }
+
+    #[test]
+    fn quic_0rtt_can_be_enabled_from_listener_config() {
+        let listener: ListenerInner = serde_json::from_value(serde_json::json!({
+            "addr": "127.0.0.1:9443",
+            "enable_0rtt": true
+        }))
+        .unwrap();
+
+        assert!(listener.enable_0rtt);
     }
 }

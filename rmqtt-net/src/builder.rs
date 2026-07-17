@@ -169,6 +169,8 @@ pub struct Builder {
 
     /// QUIC(max_idle_timeout)
     pub idle_timeout: Duration,
+    /// Accept MQTT application data during a resumed QUIC handshake.
+    pub enable_quic_0rtt: bool,
 }
 
 impl Default for Builder {
@@ -237,6 +239,7 @@ impl Builder {
             collect_cert_info: false,
 
             idle_timeout: Duration::from_secs(90),
+            enable_quic_0rtt: false,
         }
     }
 
@@ -481,6 +484,12 @@ impl Builder {
         self
     }
 
+    /// Enables TLS 1.3 early data and immediate stream acceptance for resumed QUIC connections.
+    pub fn enable_quic_0rtt(mut self, enable_quic_0rtt: bool) -> Self {
+        self.enable_quic_0rtt = enable_quic_0rtt;
+        self
+    }
+
     /// Binds the server to the configured address
     #[allow(unused_variables)]
     pub fn bind(self) -> Result<Listener> {
@@ -523,8 +532,14 @@ impl Builder {
     #[allow(unused_variables)]
     #[cfg(feature = "quic")]
     pub fn bind_quic(self) -> Result<Listener> {
+        if self.enable_quic_0rtt && self.tls_cross_certificate {
+            return Err(anyhow!("QUIC 0-RTT cannot be combined with mutual TLS authentication"));
+        }
         let mut tls_config = self.build_tls_config()?;
         tls_config.alpn_protocols = vec![b"mqtt".to_vec(), b"mqttv5".to_vec()];
+        if self.enable_quic_0rtt {
+            tls_config.max_early_data_size = u32::MAX;
+        }
         let server_crypto = QuicServerConfig::try_from(tls_config)?;
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
 
@@ -733,6 +748,8 @@ impl Listener {
             remote_addr,
             #[cfg(feature = "tls")]
             acceptor: self.tls_acceptor.clone(),
+            #[cfg(feature = "quic")]
+            quic_handshake_complete: None,
             cfg: self.cfg.clone(),
             typ: self.typ,
         })
@@ -743,7 +760,15 @@ impl Listener {
         if let Some(endpoint) = &self.quinn_endpoint {
             let incoming =
                 endpoint.accept().await.ok_or_else(|| anyhow!("No incoming QUIC connection available"))?;
-            let conn = incoming.await?;
+            let (conn, quic_handshake_complete) = if self.cfg.enable_quic_0rtt {
+                let (conn, handshake_complete) = incoming
+                    .accept()?
+                    .into_0rtt()
+                    .map_err(|_| anyhow!("Failed to enable early stream processing for QUIC connection"))?;
+                (conn, Some(handshake_complete))
+            } else {
+                (incoming.await?, None)
+            };
             let remote_addr = conn.remote_address();
 
             let (send, recv) = conn.accept_bi().await?;
@@ -754,6 +779,7 @@ impl Listener {
                 remote_addr,
                 #[cfg(feature = "tls")]
                 acceptor: self.tls_acceptor.clone(),
+                quic_handshake_complete,
                 cfg: self.cfg.clone(),
                 typ: self.typ,
             })
@@ -784,12 +810,27 @@ pub struct Acceptor<S> {
     pub(crate) socket: S,
     #[cfg(feature = "tls")]
     acceptor: Option<TlsAcceptor>,
+    #[cfg(feature = "quic")]
+    quic_handshake_complete: Option<quinn::ZeroRttAccepted>,
     /// Remote client address
     pub remote_addr: SocketAddr,
     /// Shared server configuration
     pub cfg: Arc<Builder>,
     /// Active protocol type
     pub typ: ListenerType,
+}
+
+#[cfg(feature = "quic")]
+impl Acceptor<QuinnBiStream> {
+    /// Returns whether the accepted QUIC stream was opened using 0-RTT data.
+    pub fn is_quic_0rtt(&self) -> bool {
+        self.socket.is_0rtt()
+    }
+
+    /// Takes the future that resolves when the QUIC/TLS handshake is fully authenticated.
+    pub fn take_quic_handshake_complete(&mut self) -> Option<quinn::ZeroRttAccepted> {
+        self.quic_handshake_complete.take()
+    }
 }
 
 impl<S> Acceptor<S>

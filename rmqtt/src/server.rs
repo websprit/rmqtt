@@ -408,10 +408,12 @@ async fn listen_wss(scx: ServerContext, l: &Listener, lid: ListenerId) {
 async fn listen_quic(scx: ServerContext, l: &Listener, lid: ListenerId) {
     loop {
         match l.accept_quic().await {
-            Ok(accept) => {
+            Ok(mut accept) => {
                 let scx = scx.clone();
                 tokio::spawn(async move {
-                    log::debug!("QUIC connection from {}", accept.remote_addr);
+                    let is_0rtt = accept.is_quic_0rtt();
+                    let handshake_complete = accept.take_quic_handshake_complete();
+                    log::debug!("QUIC connection from {}, 0-RTT stream: {}", accept.remote_addr, is_0rtt);
 
                     let stream = match accept.quic().await {
                         Ok(s) => s,
@@ -421,19 +423,30 @@ async fn listen_quic(scx: ServerContext, l: &Listener, lid: ListenerId) {
                         }
                     };
 
-                    match stream.mqtt().await {
-                        Ok(MqttStream::V3(s)) => {
+                    let stream = match stream.mqtt().await {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            log::info!("MQTT/QUIC version detection failed: {e}");
+                            return;
+                        }
+                    };
+
+                    // CONNECT has already arrived in 0-RTT and is buffered by the MQTT codec.
+                    // Defer authentication and session mutations until TLS Finished is verified.
+                    if let Some(handshake_complete) = handshake_complete {
+                        handshake_complete.await;
+                    }
+
+                    match stream {
+                        MqttStream::V3(s) => {
                             if let Err(e) = v3::process(scx.clone(), s, lid).await {
                                 log::info!("MQTTv3/QUIC processing error: {e}");
                             }
                         }
-                        Ok(MqttStream::V5(s)) => {
+                        MqttStream::V5(s) => {
                             if let Err(e) = v5::process(scx.clone(), s, lid).await {
                                 log::info!("MQTTv5/QUIC processing error: {e}");
                             }
-                        }
-                        Err(e) => {
-                            log::info!("MQTT/QUIC version detection failed: {e}");
                         }
                     }
                 });

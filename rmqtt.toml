@@ -326,6 +326,11 @@ listener.quic.external.addr = "0.0.0.0:9443"
 #quic max_idle_timeout, default value: 90s
 listener.quic.external.idle_timeout = "120s"
 
+#Accept MQTT CONNECT as QUIC/TLS 1.3 early data on resumed sessions.
+#Disabled by default because early data has weaker replay guarantees.
+#Cannot be combined with cross_certificate=true (mutual TLS).
+listener.quic.external.enable_0rtt = false
+
 #Whether to enable cross-certification, default value: false
 listener.quic.external.cross_certificate = false
 #This certificate is used to authenticate the server during TLS handshakes.

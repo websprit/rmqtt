@@ -76,6 +76,7 @@ All fields have `pub` visibility and fluent setter methods:
 | `.proxy_protocol(v)` | `bool` | `false` |
 | `.proxy_protocol_timeout(d)` | `Duration` | `5s` |
 | `.idle_timeout(d)` | `Duration` | `90s` |
+| `.enable_quic_0rtt(v)` | `bool` | `false`; accepts replay-sensitive early data and is incompatible with mutual TLS |
 | `.bind(self) -> Result<Listener>` | — | Binds TCP socket, returns Listener |
 | `.bind_quic(self) -> Result<Listener>` | — | `#[cfg(feature = "quic")]` QUIC bind |
 
@@ -100,6 +101,8 @@ listener.wss()?  -> Listener  // #[cfg(feature = "tls")] #[cfg(feature = "ws")]
 ```rust
 acceptor.tcp() -> Result<Dispatcher<S>>           // create TCP dispatcher
 acceptor.tls() -> Result<Dispatcher<TlsStream<S>>> // #[cfg(feature = "tls")] TLS handshake + dispatcher
+acceptor.is_quic_0rtt() -> bool                    // #[cfg(feature = "quic")] early stream marker
+acceptor.take_quic_handshake_complete()            // await before applying MQTT session side effects
 acceptor.remote_addr: SocketAddr                   // client address
 ```
 

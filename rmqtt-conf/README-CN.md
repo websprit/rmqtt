@@ -148,6 +148,7 @@ impl Listeners {
 | `cert_subject_dn_as_username` | `bool` | `false` | 使用 TLS 主题 DN 作为用户名 |
 | `collect_cert_info` | `bool` | `false` | 收集 TLS 证书信息 |
 | `idle_timeout` | `Duration` | `90s` | QUIC 空闲超时 |
+| `enable_0rtt` | `bool` | `false` | 在 QUIC 恢复握手期间接收 MQTT CONNECT；不能与双向 TLS 同时启用 |
 
 ### `Plugins` — 插件配置加载
 

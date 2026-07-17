@@ -248,6 +248,7 @@ fn config_builder(cfg: &Listener) -> Builder {
         .cert_subject_dn_as_username(cfg.cert_subject_dn_as_username)
         .collect_cert_info(cfg.collect_cert_info)
         .idle_timeout(cfg.idle_timeout)
+        .enable_quic_0rtt(cfg.enable_0rtt)
 }
 
 fn config_args(cfg: &Settings) -> CommandArgs {

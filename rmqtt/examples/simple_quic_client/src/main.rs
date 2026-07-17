@@ -1,7 +1,7 @@
 //! Example: MQTT client over QUIC transport.
-//! Connects to a QUIC-enabled MQTT server, sends a CONNECT and PUBLISH
-//! packet, and receives CONNACK / PUBACK responses. Includes a
-//! `SkipServerVerification` helper for testing with self-signed certificates.
+//! Establishes one MQTT/QUIC connection to obtain a TLS session ticket, then reconnects and sends
+//! MQTT CONNECT as QUIC 0-RTT data. The example waits for 0-RTT acceptance before sending PUBLISH,
+//! because non-idempotent MQTT packets must not be sent as replayable early data.
 
 use bytes::Bytes;
 use bytestring::ByteString;
@@ -13,6 +13,7 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use simple_logger::SimpleLogger;
 use std::num::NonZeroU16;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::codec::Framed;
 
 /// AWS-LC based TLS provider (non-Windows platforms)
@@ -29,6 +30,8 @@ use rmqtt_codec::{
 };
 use rmqtt_net::{QuinnBiStream, Result};
 
+type MqttQuicStream = Framed<QuinnBiStream, MqttCodec>;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     SimpleLogger::new().with_level(log::LevelFilter::Info).init()?;
@@ -39,24 +42,62 @@ async fn main() -> Result<()> {
     let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
     endpoint.set_default_client_config(client_config);
 
-    // Connect to the QUIC server
     let server_addr = "127.0.0.1:9443".parse()?;
-    let conn = endpoint.connect(server_addr, "localhost")?.await?;
 
-    // Open a bidirectional QUIC stream
-    let (send, recv) = conn.open_bi().await?;
+    // The first connection completes a normal handshake so the client can receive a session ticket.
+    let first = endpoint.connect(server_addr, "localhost")?.await?;
+    let mut framed = send_connect(&first, "cid-ticket").await?;
+    recv_connack(&mut framed).await?;
+    publish_once(&mut framed).await?;
+    framed.close().await?;
+    first.close(0_u32.into(), b"reconnect with 0-rtt");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The second connection sends CONNECT before the resumed TLS handshake completes.
+    let connecting = endpoint.connect(server_addr, "localhost")?;
+    let (connection, mut framed) = match connecting.into_0rtt() {
+        Ok((connection, accepted)) => {
+            let mut framed = send_connect(&connection, "cid-0rtt").await?;
+            if accepted.await {
+                log::info!("Server accepted MQTT CONNECT as QUIC 0-RTT data");
+                recv_connack(&mut framed).await?;
+                (connection, framed)
+            } else {
+                log::warn!("Server rejected QUIC 0-RTT; retransmitting CONNECT after the handshake");
+                drop(framed);
+                let mut framed = send_connect(&connection, "cid-0rtt").await?;
+                recv_connack(&mut framed).await?;
+                (connection, framed)
+            }
+        }
+        Err(connecting) => {
+            log::warn!("No reusable 0-RTT ticket; falling back to a normal QUIC handshake");
+            let connection = connecting.await?;
+            let mut framed = send_connect(&connection, "cid-0rtt").await?;
+            recv_connack(&mut framed).await?;
+            (connection, framed)
+        }
+    };
+
+    // Wait until early data is accepted before sending state-changing MQTT packets.
+    publish_once(&mut framed).await?;
+    framed.close().await?;
+    connection.close(0_u32.into(), b"done");
+    endpoint.wait_idle().await;
+
+    Ok(())
+}
+
+async fn send_connect(connection: &quinn::Connection, client_id: &str) -> Result<MqttQuicStream> {
+    let (send, recv) = connection.open_bi().await?;
     let stream = QuinnBiStream::new(send, recv);
-
-    // Wrap the stream using Framed for MQTT codec handling
     let mut framed = Framed::new(stream, MqttCodec::V3(CodecV3::new(1024 * 1024)));
-
-    // Send CONNECT packet
     let connect = Connect {
         protocol: Protocol(4),
         clean_session: true,
         keep_alive: 60,
         last_will: None,
-        client_id: "cid-001".into(),
+        client_id: client_id.into(),
         username: None,
         password: None,
         cert: None,
@@ -64,13 +105,19 @@ async fn main() -> Result<()> {
     framed.send(MqttPacket::V3(rmqtt_codec::v3::Packet::Connect(Box::new(connect)))).await?;
     framed.flush().await?;
     log::info!("Sent CONNECT");
+    Ok(framed)
+}
 
-    // Wait for CONNACK response
+async fn recv_connack(framed: &mut MqttQuicStream) -> Result<()> {
     if let Some(Ok((MqttPacket::V3(rmqtt_codec::v3::Packet::ConnectAck(ack)), _))) = framed.next().await {
         log::info!("Received CONNACK: {ack:?}");
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("Expected CONNACK from MQTT/QUIC server"))
     }
+}
 
-    // Send PUBLISH packet
+async fn publish_once(framed: &mut MqttQuicStream) -> Result<()> {
     let publish = Publish {
         dup: false,
         retain: false,
@@ -84,16 +131,14 @@ async fn main() -> Result<()> {
     framed.flush().await?;
     log::info!("Sent PUBLISH");
 
-    // Wait for PUBACK response
     if let Some(Ok((MqttPacket::V3(rmqtt_codec::v3::Packet::PublishAck { packet_id }), _))) =
         framed.next().await
     {
         log::info!("Received PUBACK for packet_id {packet_id:?}");
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("Expected PUBACK from MQTT/QUIC server"))
     }
-
-    framed.close().await?;
-
-    Ok(())
 }
 
 fn build_client_config() -> Result<quinn::ClientConfig> {
@@ -108,6 +153,7 @@ fn build_client_config() -> Result<quinn::ClientConfig> {
         .with_no_client_auth();
 
     client_crypto.alpn_protocols = vec![b"mqtt".to_vec(), b"mqttv5".to_vec()];
+    client_crypto.enable_early_data = true;
     client_crypto.dangerous().set_certificate_verifier(Arc::new(SkipServerVerification));
 
     let server_crypto = QuicClientConfig::try_from(client_crypto)?;
