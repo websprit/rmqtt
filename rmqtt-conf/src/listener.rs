@@ -184,6 +184,209 @@ impl Deref for Listener {
     }
 }
 
+/// QUIC multistream operating mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MultistreamMode {
+    /// Disable MQTT-over-QUIC data streams and use only the initial control stream.
+    #[default]
+    Disabled,
+    /// Enable the simple-v1 MQTT-over-QUIC multistream negotiation mode.
+    Simple,
+}
+
+/// QUIC multistream listener configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Multistream {
+    /// Negotiated multistream mode for this QUIC listener.
+    #[serde(default)]
+    pub mode: MultistreamMode,
+    /// Maximum number of concurrent MQTT data streams after multistream activation.
+    #[serde(default = "Multistream::max_data_streams_default")]
+    pub max_data_streams: u32,
+    /// Maximum rate for opening MQTT data streams on one QUIC connection.
+    #[serde(default = "Multistream::stream_open_rate_default")]
+    pub stream_open_rate: u32,
+    /// Idle timeout for MQTT data streams after multistream activation.
+    #[serde(default = "Multistream::stream_idle_timeout_default", deserialize_with = "deserialize_duration")]
+    pub stream_idle_timeout: Duration,
+    /// Number of packets queued for a multistream QUIC connection.
+    #[serde(default = "Multistream::connection_mailbox_packets_default")]
+    pub connection_mailbox_packets: usize,
+    /// Byte budget for data buffered by one multistream QUIC connection.
+    #[serde(default = "Multistream::connection_buffer_bytes_default")]
+    pub connection_buffer_bytes: Bytesize,
+}
+
+impl Default for Multistream {
+    fn default() -> Self {
+        Self {
+            mode: MultistreamMode::Disabled,
+            max_data_streams: Self::max_data_streams_default(),
+            stream_open_rate: Self::stream_open_rate_default(),
+            stream_idle_timeout: Self::stream_idle_timeout_default(),
+            connection_mailbox_packets: Self::connection_mailbox_packets_default(),
+            connection_buffer_bytes: Self::connection_buffer_bytes_default(),
+        }
+    }
+}
+
+impl Multistream {
+    /// Highest supported configured data-stream count.
+    ///
+    /// `u32::MAX` is reserved as an internal sentinel, so configured values
+    /// are capped at `u32::MAX - 1`.
+    pub const MAX_DATA_STREAMS: u32 = u32::MAX - 1;
+
+    #[inline]
+    fn max_data_streams_default() -> u32 {
+        8
+    }
+
+    #[inline]
+    fn stream_open_rate_default() -> u32 {
+        32
+    }
+
+    #[inline]
+    fn stream_idle_timeout_default() -> Duration {
+        Duration::from_secs(60)
+    }
+
+    #[inline]
+    fn connection_mailbox_packets_default() -> usize {
+        256
+    }
+
+    #[inline]
+    fn connection_buffer_bytes_default() -> Bytesize {
+        Bytesize(1024 * 1024)
+    }
+
+    #[inline]
+    /// Returns the configured data-stream count capped to the supported range.
+    pub fn max_data_streams(&self) -> u32 {
+        self.max_data_streams.min(Self::MAX_DATA_STREAMS)
+    }
+}
+
+impl MultistreamMode {
+    #[inline]
+    /// Returns the TOML/string representation for this multistream mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Simple => "simple",
+        }
+    }
+}
+
+/// QUIC 0-RTT operating mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZeroRttMode {
+    /// Disable QUIC 0-RTT and reject early MQTT application data.
+    #[default]
+    Disabled,
+    /// Allow 0-RTT only behind a resumed-handshake completion gate.
+    HandshakeGated,
+}
+
+impl ZeroRttMode {
+    #[inline]
+    /// Returns the TOML/string representation for this 0-RTT mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::HandshakeGated => "handshake_gated",
+        }
+    }
+}
+
+/// Credential policy used when QUIC 0-RTT is explicitly enabled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZeroRttCredentialProfile {
+    /// Reject QUIC 0-RTT until a non-deny credential profile is configured.
+    #[default]
+    Deny,
+    /// Permit 0-RTT only for listeners that allow anonymous MQTT clients.
+    Anonymous,
+    /// Permit 0-RTT only for non-anonymous listeners using short-lived credentials.
+    ShortLivedToken,
+}
+
+impl ZeroRttCredentialProfile {
+    #[inline]
+    /// Returns the TOML/string representation for this credential profile.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Anonymous => "anonymous",
+            Self::ShortLivedToken => "short_lived_token",
+        }
+    }
+}
+
+/// QUIC 0-RTT listener policy.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ZeroRtt {
+    /// 0-RTT operating mode for this listener.
+    #[serde(default)]
+    pub mode: ZeroRttMode,
+    /// Credential policy required before 0-RTT can be enabled.
+    #[serde(default)]
+    pub credential_profile: ZeroRttCredentialProfile,
+    /// Auth-policy epoch included in ticket fingerprints to invalidate old tickets.
+    #[serde(default)]
+    pub auth_policy_epoch: u64,
+    /// Capacity of the stateful, single-use QUIC 0-RTT ticket cache.
+    #[serde(default = "ZeroRtt::ticket_capacity_default")]
+    pub ticket_capacity: usize,
+    /// Time-to-live for cached QUIC 0-RTT tickets.
+    #[serde(default = "ZeroRtt::ticket_ttl_default", deserialize_with = "deserialize_duration")]
+    pub ticket_ttl: Duration,
+    /// Bytes accepted before the resumed QUIC handshake is fully finished.
+    #[serde(default = "ZeroRtt::pre_finished_read_budget_default")]
+    pub pre_finished_read_budget: Bytesize,
+}
+
+impl Default for ZeroRtt {
+    fn default() -> Self {
+        Self {
+            mode: ZeroRttMode::Disabled,
+            credential_profile: ZeroRttCredentialProfile::Deny,
+            auth_policy_epoch: 0,
+            ticket_capacity: Self::ticket_capacity_default(),
+            ticket_ttl: Self::ticket_ttl_default(),
+            pre_finished_read_budget: Self::pre_finished_read_budget_default(),
+        }
+    }
+}
+
+impl ZeroRtt {
+    #[inline]
+    fn ticket_capacity_default() -> usize {
+        4096
+    }
+
+    #[inline]
+    fn ticket_ttl_default() -> Duration {
+        Duration::from_secs(10 * 60)
+    }
+
+    #[inline]
+    fn pre_finished_read_budget_default() -> Bytesize {
+        Bytesize(64 * 1024)
+    }
+
+    #[inline]
+    /// Returns whether this listener enables handshake-gated QUIC 0-RTT.
+    pub fn enabled(&self) -> bool {
+        self.mode == ZeroRttMode::HandshakeGated
+    }
+}
+
 /// Detailed configuration for a single network listener.
 ///
 /// Contains all tunable parameters including connection limits, keepalive
@@ -305,6 +508,12 @@ pub struct ListenerInner {
     /// Enables receiving MQTT CONNECT during resumed QUIC handshakes.
     #[serde(default)]
     pub enable_0rtt: bool,
+    /// Detailed QUIC 0-RTT policy for this listener.
+    #[serde(default)]
+    pub zero_rtt: ZeroRtt,
+    /// QUIC multistream settings for this listener.
+    #[serde(default)]
+    pub multistream: Multistream,
 }
 
 impl Default for ListenerInner {
@@ -354,6 +563,8 @@ impl Default for ListenerInner {
             collect_cert_info: false,
             idle_timeout: ListenerInner::idle_timeout_default(),
             enable_0rtt: false,
+            zero_rtt: ZeroRtt::default(),
+            multistream: Multistream::default(),
         }
     }
 }
@@ -545,11 +756,22 @@ impl ListenerInner {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::ListenerInner;
 
     #[test]
     fn quic_0rtt_is_disabled_by_default() {
         assert!(!ListenerInner::default().enable_0rtt);
+        assert_eq!(ListenerInner::default().zero_rtt.mode, super::ZeroRttMode::Disabled);
+        assert_eq!(
+            ListenerInner::default().zero_rtt.credential_profile,
+            super::ZeroRttCredentialProfile::Deny
+        );
+        assert_eq!(ListenerInner::default().zero_rtt.auth_policy_epoch, 0);
+        assert_eq!(ListenerInner::default().zero_rtt.ticket_capacity, 4096);
+        assert_eq!(ListenerInner::default().zero_rtt.ticket_ttl, Duration::from_secs(10 * 60));
+        assert_eq!(ListenerInner::default().zero_rtt.pre_finished_read_budget.as_usize(), 64 * 1024);
     }
 
     #[test]
@@ -561,5 +783,63 @@ mod tests {
         .unwrap();
 
         assert!(listener.enable_0rtt);
+    }
+
+    #[test]
+    fn quic_0rtt_policy_can_be_configured_from_nested_listener_config() {
+        let listener: ListenerInner = serde_json::from_value(serde_json::json!({
+            "addr": "127.0.0.1:9443",
+            "zero_rtt": {
+                "mode": "handshake_gated",
+                "credential_profile": "short_lived_token",
+                "auth_policy_epoch": 7,
+                "ticket_capacity": 128,
+                "ticket_ttl": "30s",
+                "pre_finished_read_budget": "32K"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(listener.zero_rtt.mode, super::ZeroRttMode::HandshakeGated);
+        assert_eq!(listener.zero_rtt.credential_profile, super::ZeroRttCredentialProfile::ShortLivedToken);
+        assert_eq!(listener.zero_rtt.auth_policy_epoch, 7);
+        assert_eq!(listener.zero_rtt.ticket_capacity, 128);
+        assert_eq!(listener.zero_rtt.ticket_ttl, Duration::from_secs(30));
+        assert_eq!(listener.zero_rtt.pre_finished_read_budget.as_usize(), 32 * 1024);
+    }
+
+    #[test]
+    fn multistream_is_disabled_by_default() {
+        let multistream = ListenerInner::default().multistream;
+
+        assert_eq!(multistream.mode, super::MultistreamMode::Disabled);
+        assert_eq!(multistream.max_data_streams, 8);
+        assert_eq!(multistream.stream_open_rate, 32);
+        assert_eq!(multistream.stream_idle_timeout, Duration::from_secs(60));
+        assert_eq!(multistream.connection_mailbox_packets, 256);
+        assert_eq!(multistream.connection_buffer_bytes.as_usize(), 1024 * 1024);
+    }
+
+    #[test]
+    fn multistream_can_be_configured_from_nested_listener_config() {
+        let listener: ListenerInner = serde_json::from_value(serde_json::json!({
+            "addr": "127.0.0.1:9443",
+            "multistream": {
+                "mode": "simple",
+                "max_data_streams": 4,
+                "stream_open_rate": 16,
+                "stream_idle_timeout": "30s",
+                "connection_mailbox_packets": 128,
+                "connection_buffer_bytes": "512K"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(listener.multistream.mode, super::MultistreamMode::Simple);
+        assert_eq!(listener.multistream.max_data_streams, 4);
+        assert_eq!(listener.multistream.stream_open_rate, 16);
+        assert_eq!(listener.multistream.stream_idle_timeout, Duration::from_secs(30));
+        assert_eq!(listener.multistream.connection_mailbox_packets, 128);
+        assert_eq!(listener.multistream.connection_buffer_bytes.as_usize(), 512 * 1024);
     }
 }

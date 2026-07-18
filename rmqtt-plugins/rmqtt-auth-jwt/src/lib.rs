@@ -390,11 +390,17 @@ impl Handler for AuthHandler {
                     log::debug!("Keepalive auth-jwt, is_expired: {:?}", auth.is_expired());
                     if auth.is_expired() && self.cfg.read().await.disconnect_if_expiry {
                         if let Some(tx) = self.scx.extends.shared().await.entry(s.id().clone()).tx() {
-                            if let Err(e) = tx.unbounded_send(Message::Closed(Reason::ConnectDisconnect(
-                                Some(Disconnect::Other("JWT Auth expired".into())),
-                            ))) {
-                                log::warn!("{} {}", s.id(), e);
-                            }
+                            let id = s.id().clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = tx
+                                    .send(Message::Closed(Reason::ConnectDisconnect(Some(
+                                        Disconnect::Other("JWT Auth expired".into()),
+                                    ))))
+                                    .await
+                                {
+                                    log::warn!("{id} {e}");
+                                }
+                            });
                         }
                     }
                 }

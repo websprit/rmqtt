@@ -78,10 +78,13 @@ pub mod hook; // Event hook system
 pub mod inflight; // In-flight message tracking
 pub mod node; // Cluster node management
 pub mod queue; // Message queue implementation
+mod route; // MQTT transaction-to-flow routing ledger
 pub mod router; // Message routing core
 pub mod server; // Server lifecycle management
 pub mod session; // Client session handling
+mod session_link; // Transport-neutral session I/O adapter
 pub mod shared; // Shared state management
+mod subscription_binding; // Connection-local subscription flow routing
 
 // Subscription Management
 #[cfg(any(feature = "auto-subscription", feature = "shared-subscription"))]

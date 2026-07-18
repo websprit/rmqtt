@@ -22,7 +22,7 @@ quic = ["tls"]
 
 [dependencies]
 rmqtt-codec.workspace = true
-tokio = { workspace = true,  features = ["net", "time", "io-util"] }
+tokio = { workspace = true,  features = ["net", "time", "io-util", "macros"] }
 tokio-util = { workspace = true, features = ["codec"] }
 futures.workspace = true
 log.workspace = true

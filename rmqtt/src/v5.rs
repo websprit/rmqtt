@@ -56,14 +56,20 @@ use uuid::Uuid;
 
 use crate::codec::v5::{Connect as ConnectV5, ConnectAck, ConnectAckReason as ConnectAckReasonV5};
 use crate::context::ServerContext;
-use crate::net::v5;
+use crate::net::{v5, MqttStream, SerialMqttLink};
+#[cfg(feature = "quic")]
+use crate::net::{QuicActivation, QuinnBiStream};
 use crate::session::{Session, SessionState};
+use crate::session_link::SessionLink;
 use crate::types::{
     ClientId, ConnectAckReason, ConnectInfo, Id, ListenerConfig, ListenerId, Message, OfflineSession,
-    SessionSubs, Sink,
+    SessionSubs,
 };
 use crate::utils::timestamp_millis;
 use crate::{Error, Result};
+
+const QUIC_MULTISTREAM_PROPERTY: &str = "rmqtt-quic-multistream";
+const QUIC_MULTISTREAM_SIMPLE_V1: &str = "simple-v1";
 
 /// Processes a new MQTT v5.0 connection through its full lifecycle.
 ///
@@ -84,13 +90,13 @@ pub(crate) async fn process<Io>(
 where
     Io: AsyncRead + AsyncWrite + Unpin,
 {
-    let (state, keep_alive) = {
+    let (state, ack, keep_alive, _) = {
         scx.handshakings.inc();
         defer! {
             scx.handshakings.dec();
         }
 
-        let (state, keep_alive) = match handshake(&scx, &mut sink, lid).await {
+        let outcome = match handshake(&scx, &mut sink, lid, false).await {
             Ok(c) => c,
             Err((ack_code, e)) => {
                 refused_ack(&scx, &mut sink, None, ack_code, e.to_string()).await?;
@@ -100,11 +106,54 @@ where
                 return Err(e);
             }
         };
-        (state, keep_alive)
+        outcome
     };
 
-    state.run(Sink::V5(sink), keep_alive).await;
+    sink.send_connect_ack(ack).await?;
+    sink.flush().await?;
 
+    state
+        .run(
+            SessionLink::new(
+                rmqtt_codec::version::ProtocolVersion::MQTT5,
+                SerialMqttLink::new(MqttStream::V5(sink)),
+            ),
+            keep_alive,
+        )
+        .await;
+
+    Ok(())
+}
+
+#[cfg(feature = "quic")]
+pub(crate) async fn process_quic(
+    scx: ServerContext,
+    mut sink: v5::MqttStream<QuinnBiStream>,
+    activation: QuicActivation,
+    lid: ListenerId,
+) -> Result<()> {
+    let (state, ack, keep_alive, multistream_accepted) = {
+        scx.handshakings.inc();
+        defer! {
+            scx.handshakings.dec();
+        }
+
+        match handshake(&scx, &mut sink, lid, true).await {
+            Ok(outcome) => outcome,
+            Err((ack_code, e)) => {
+                refused_ack(&scx, &mut sink, None, ack_code, e.to_string()).await?;
+                if let Err(close_error) = sink.close().await {
+                    log::info!("{lid} close io error, {close_error}");
+                }
+                return Err(e);
+            }
+        }
+    };
+
+    let max_data_streams = if multistream_accepted { sink.cfg.multistream_max_data_streams } else { 0 };
+    let committed = activation.send_v5_connack_and_commit(&mut sink, ack).await?;
+    let link = committed.activate_multistream(MqttStream::V5(sink), max_data_streams);
+    state.run(SessionLink::new(rmqtt_codec::version::ProtocolVersion::MQTT5, link), keep_alive).await;
     Ok(())
 }
 
@@ -113,7 +162,8 @@ async fn handshake<Io>(
     scx: &ServerContext,
     sink: &mut v5::MqttStream<Io>,
     lid: ListenerId,
-) -> std::result::Result<(SessionState, u16), (ConnectAckReason, Error)>
+    allow_multistream: bool,
+) -> std::result::Result<(SessionState, ConnectAck, u16, bool), (ConnectAckReason, Error)>
 where
     Io: AsyncRead + AsyncWrite + Unpin,
 {
@@ -128,6 +178,9 @@ where
         .recv_connect(sink.cfg.handshake_timeout)
         .await
         .map_err(|e| (ConnectAckReason::V5(ConnectAckReasonV5::ServerUnavailable), e))?;
+    let multistream_requested = requests_quic_multistream(&c);
+    let multistream_accepted =
+        allow_multistream && sink.cfg.multistream_mode == "simple" && multistream_requested;
 
     log::debug!(
         "new Connection: local_addr: {:?}, remote_addr: {:?}, listen_cfg: {:?}",
@@ -162,17 +215,20 @@ where
 
     let now = std::time::Instant::now();
     let exec = scx.handshake_exec.get(sink.cfg.laddr.port(), &sink.cfg);
-    match _handshake(scx.clone(), id.clone(), c, sink.cfg.clone(), assigned_client_id, now)
-        .spawn(&exec)
-        .result()
-        .await
+    match _handshake(
+        scx.clone(),
+        id.clone(),
+        c,
+        sink.cfg.clone(),
+        assigned_client_id,
+        multistream_accepted,
+        now,
+    )
+    .spawn(&exec)
+    .result()
+    .await
     {
-        Ok(Ok((state, ack, keep_alive))) => {
-            sink.send_connect_ack(ack)
-                .await
-                .map_err(|e| (ConnectAckReason::V5(ConnectAckReasonV5::ServerUnavailable), e))?;
-            Ok((state, keep_alive))
-        }
+        Ok(Ok((state, ack, keep_alive))) => Ok((state, ack, keep_alive, multistream_accepted)),
         Ok(Err((ack_code, e))) => {
             log::info!("{id:?} Connection Refused, handshake error, reason: {ack_code:?}, {e}");
             Err((ack_code, e))
@@ -194,6 +250,7 @@ async fn _handshake(
     connect: Box<ConnectV5>,
     listen_cfg: ListenerConfig,
     is_assigned_client_id: bool,
+    multistream_accepted: bool,
     hdshk_start: std::time::Instant,
 ) -> std::result::Result<(SessionState, ConnectAck, u16), (ConnectAckReason, Error)> {
     let connect_info = ConnectInfo::V5(id.clone(), connect);
@@ -271,8 +328,13 @@ async fn _handshake(
 
     let max_inflight = fitter.max_inflight();
     let max_mqueue_len = fitter.max_mqueue_len();
+    let inbound_inflight_packet_ids = offline_info
+        .as_ref()
+        .filter(|_| !clean_session)
+        .map(|offline| offline.inbound_inflight_packet_ids.clone())
+        .unwrap_or_default();
 
-    let session = match Session::new(
+    let session = match Session::new_with_inbound_inflight(
         id,
         scx,
         max_mqueue_len,
@@ -289,6 +351,7 @@ async fn _handshake(
         SessionSubs::new(),
         None,
         offline_info.as_ref().map(|o| o.id.clone()),
+        inbound_inflight_packet_ids,
     )
     .await
     {
@@ -313,9 +376,17 @@ async fn _handshake(
         hook.session_created().await;
     }
 
-    let client_topic_alias_max = session.fitter.max_client_topic_aliases();
-    let server_topic_alias_max = session.fitter.max_server_topic_aliases();
-    let state = SessionState::new(session, hook, server_topic_alias_max, client_topic_alias_max);
+    let client_topic_alias_max =
+        if multistream_accepted { 0 } else { session.fitter.max_client_topic_aliases() };
+    let server_topic_alias_max =
+        if multistream_accepted { 0 } else { session.fitter.max_server_topic_aliases() };
+    let state = SessionState::new(
+        session,
+        hook,
+        server_topic_alias_max,
+        client_topic_alias_max,
+        multistream_accepted,
+    );
 
     if let Err(e) = entry.set(state.session().clone(), state.tx().clone()).await {
         return Err((ConnectAckReason::V5(ConnectAckReasonV5::ServerUnavailable), e));
@@ -334,7 +405,7 @@ async fn _handshake(
 
     //transfer session state
     if let Some(o) = offline_info {
-        if let Err(e) = state.tx().unbounded_send(Message::SessionStateTransfer(o, clean_session)) {
+        if let Err(e) = state.tx().try_send(Message::SessionStateTransfer(o, clean_session)) {
             return Err((ConnectAckReason::V5(ConnectAckReasonV5::ServerUnavailable), e.into()));
         }
     }
@@ -347,7 +418,7 @@ async fn _handshake(
             match auto_subscription.subscribes(state.id()).await {
                 Err(e) => return Err((ConnectAckReason::V5(ConnectAckReasonV5::ServerUnavailable), e)),
                 Ok(subs) => {
-                    if let Err(e) = state.tx().unbounded_send(Message::Subscribes(subs, None)) {
+                    if let Err(e) = state.tx().try_send(Message::Subscribes(subs, None)) {
                         return Err((ConnectAckReason::V5(ConnectAckReasonV5::ServerUnavailable), e.into()));
                     }
                 }
@@ -390,7 +461,7 @@ async fn _handshake(
 
     let assigned_client_id = if is_assigned_client_id { Some(state.id.client_id.clone()) } else { None };
 
-    let ack = ConnectAck {
+    let mut ack = ConnectAck {
         session_present,
         server_keepalive_sec: Some(server_keepalive_sec),
         session_expiry_interval_secs,
@@ -405,8 +476,18 @@ async fn _handshake(
         shared_subscription_available,
         ..Default::default()
     };
+    if multistream_accepted {
+        ack.user_properties.push((QUIC_MULTISTREAM_PROPERTY.into(), QUIC_MULTISTREAM_SIMPLE_V1.into()));
+    }
 
     Ok((state, ack, keep_alive))
+}
+
+fn requests_quic_multistream(connect: &ConnectV5) -> bool {
+    connect.user_properties.iter().any(|(key, value)| {
+        AsRef::<str>::as_ref(key) == QUIC_MULTISTREAM_PROPERTY
+            && AsRef::<str>::as_ref(value) == QUIC_MULTISTREAM_SIMPLE_V1
+    })
 }
 
 async fn refused_ack<Io>(
@@ -437,4 +518,21 @@ where
         ConnectAckReasonV5::ServerUnavailable
     };
     sink.send_connect_ack(ConnectAck { reason_code, ..Default::default() }).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multistream_negotiation_requires_the_exact_connect_user_property() {
+        let mut connect = ConnectV5::default();
+        assert!(!requests_quic_multistream(&connect));
+
+        connect.user_properties.push((QUIC_MULTISTREAM_PROPERTY.into(), "future-version".into()));
+        assert!(!requests_quic_multistream(&connect));
+
+        connect.user_properties.push((QUIC_MULTISTREAM_PROPERTY.into(), QUIC_MULTISTREAM_SIMPLE_V1.into()));
+        assert!(requests_quic_multistream(&connect));
+    }
 }

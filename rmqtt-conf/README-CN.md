@@ -148,7 +148,9 @@ impl Listeners {
 | `cert_subject_dn_as_username` | `bool` | `false` | 使用 TLS 主题 DN 作为用户名 |
 | `collect_cert_info` | `bool` | `false` | 收集 TLS 证书信息 |
 | `idle_timeout` | `Duration` | `90s` | QUIC 空闲超时 |
-| `enable_0rtt` | `bool` | `false` | 在 QUIC 恢复握手期间接收 MQTT CONNECT；不能与双向 TLS 同时启用 |
+| `enable_0rtt` | `bool` | `false` | 兼容旧配置的 QUIC 0-RTT 开关；新部署应使用 `zero_rtt.mode` |
+| `zero_rtt` | `ZeroRtt` | disabled/deny | Finished 栅栏、单次消费 ticket、凭据 profile、TTL/容量、认证 epoch 和握手前 transport budget |
+| `multistream` | `Multistream` | disabled | simple-v1 模式、流数量/速率/空闲限制、packet mailbox 与连接级字节预算 |
 
 ### `Plugins` — 插件配置加载
 

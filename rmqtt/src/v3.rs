@@ -41,11 +41,14 @@ use uuid::Uuid;
 use crate::codec::v3::{Connect as ConnectV3, ConnectAckReason as ConnectAckReasonV3};
 use crate::context::ServerContext;
 use crate::net::v3;
-use crate::net::MqttError;
+use crate::net::{MqttError, MqttStream, SerialMqttLink};
+#[cfg(feature = "quic")]
+use crate::net::{QuicActivation, QuinnBiStream};
 use crate::session::{Session, SessionState};
+use crate::session_link::SessionLink;
 use crate::types::{
     ClientId, ConnectAckReason, ConnectInfo, Id, ListenerConfig, ListenerId, Message, OfflineSession,
-    SessionSubs, Sink,
+    SessionSubs,
 };
 use crate::utils::timestamp_millis;
 use crate::{Error, Result};
@@ -68,13 +71,13 @@ pub(crate) async fn process<Io>(
 where
     Io: AsyncRead + AsyncWrite + Unpin,
 {
-    let (state, keep_alive) = {
+    let (state, keep_alive, session_present) = {
         scx.handshakings.inc();
         defer! {
             scx.handshakings.dec();
         }
 
-        let (state, keep_alive) = match handshake(&scx, &mut sink, lid).await {
+        let (state, keep_alive, session_present) = match handshake(&scx, &mut sink, lid).await {
             Ok(c) => c,
             Err((ack_code, e)) => {
                 refused_ack_v3(&scx, &mut sink, None, ack_code, e.to_string()).await?;
@@ -84,11 +87,57 @@ where
                 return Err(e);
             }
         };
-        (state, keep_alive)
+        (state, keep_alive, session_present)
     };
 
-    state.run(Sink::V3(sink), keep_alive).await;
+    sink.send_connect_ack(ConnectAckReasonV3::ConnectionAccepted, session_present).await?;
+    sink.flush().await?;
 
+    state
+        .run(
+            SessionLink::new(
+                rmqtt_codec::version::ProtocolVersion::MQTT3,
+                SerialMqttLink::new(MqttStream::V3(sink)),
+            ),
+            keep_alive,
+        )
+        .await;
+
+    Ok(())
+}
+
+#[cfg(feature = "quic")]
+pub(crate) async fn process_quic(
+    scx: ServerContext,
+    mut sink: v3::MqttStream<QuinnBiStream>,
+    activation: QuicActivation,
+    lid: ListenerId,
+) -> Result<()> {
+    let (state, keep_alive, session_present) = {
+        scx.handshakings.inc();
+        defer! {
+            scx.handshakings.dec();
+        }
+
+        match handshake(&scx, &mut sink, lid).await {
+            Ok(outcome) => outcome,
+            Err((ack_code, e)) => {
+                refused_ack_v3(&scx, &mut sink, None, ack_code, e.to_string()).await?;
+                if let Err(close_error) = sink.close().await {
+                    log::info!("{lid} close io error, {close_error}");
+                }
+                return Err(e);
+            }
+        }
+    };
+
+    let max_data_streams =
+        if sink.cfg.multistream_mode == "simple" { sink.cfg.multistream_max_data_streams } else { 0 };
+    let committed = activation
+        .send_v3_connack_and_commit(&mut sink, ConnectAckReasonV3::ConnectionAccepted, session_present)
+        .await?;
+    let link = committed.activate_multistream(MqttStream::V3(sink), max_data_streams);
+    state.run(SessionLink::new(rmqtt_codec::version::ProtocolVersion::MQTT3, link), keep_alive).await;
     Ok(())
 }
 
@@ -97,7 +146,7 @@ async fn handshake<Io>(
     scx: &ServerContext,
     sink: &mut v3::MqttStream<Io>,
     lid: ListenerId,
-) -> std::result::Result<(SessionState, u16), (ConnectAckReason, Error)>
+) -> std::result::Result<(SessionState, u16, bool), (ConnectAckReason, Error)>
 where
     Io: AsyncRead + AsyncWrite + Unpin,
 {
@@ -160,10 +209,7 @@ where
                 .session_present()
                 .await
                 .map_err(|e| (ConnectAckReason::V3(ConnectAckReasonV3::ServiceUnavailable), e))?;
-            sink.send_connect_ack(ConnectAckReasonV3::ConnectionAccepted, session_present)
-                .await
-                .map_err(|e| (ConnectAckReason::V3(ConnectAckReasonV3::ServiceUnavailable), e))?;
-            Ok((state, keep_alive))
+            Ok((state, keep_alive, session_present))
         }
         Ok(Err((ack_code, e))) => {
             log::info!("{id:?} Connection Refused, handshake error, reason: {ack_code:?}, {e}");
@@ -254,8 +300,13 @@ async fn _handshake(
 
     let max_inflight = fitter.max_inflight();
     let max_mqueue_len = fitter.max_mqueue_len();
+    let inbound_inflight_packet_ids = offline_info
+        .as_ref()
+        .filter(|_| !clean_session)
+        .map(|offline| offline.inbound_inflight_packet_ids.clone())
+        .unwrap_or_default();
 
-    let session = match Session::new(
+    let session = match Session::new_with_inbound_inflight(
         id,
         scx,
         max_mqueue_len,
@@ -272,6 +323,7 @@ async fn _handshake(
         SessionSubs::new(),
         None,
         offline_info.as_ref().map(|o| o.id.clone()),
+        inbound_inflight_packet_ids,
     )
     .await
     {
@@ -296,7 +348,7 @@ async fn _handshake(
         hook.session_created().await;
     }
 
-    let state = SessionState::new(session, hook, 0, 0);
+    let state = SessionState::new(session, hook, 0, 0, false);
 
     if let Err(e) = entry.set(state.session().clone(), state.tx().clone()).await {
         return Err((ConnectAckReason::V3(ConnectAckReasonV3::ServiceUnavailable), e));
@@ -315,7 +367,7 @@ async fn _handshake(
 
     //transfer session state
     if let Some(o) = offline_info {
-        if let Err(e) = state.tx().unbounded_send(Message::SessionStateTransfer(o, clean_session)) {
+        if let Err(e) = state.tx().try_send(Message::SessionStateTransfer(o, clean_session)) {
             return Err((ConnectAckReason::V3(ConnectAckReasonV3::ServiceUnavailable), e.into()));
         }
     }
@@ -328,7 +380,7 @@ async fn _handshake(
             match auto_subscription.subscribes(state.id()).await {
                 Err(e) => return Err((ConnectAckReason::V3(ConnectAckReasonV3::ServiceUnavailable), e)),
                 Ok(subs) => {
-                    if let Err(e) = state.tx().unbounded_send(Message::Subscribes(subs, None)) {
+                    if let Err(e) = state.tx().try_send(Message::Subscribes(subs, None)) {
                         return Err((ConnectAckReason::V3(ConnectAckReasonV3::ServiceUnavailable), e.into()));
                     }
                 }

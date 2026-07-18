@@ -16,6 +16,7 @@
 #![deny(unsafe_code)]
 
 use std::convert::From as _;
+use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,7 +55,10 @@ use rmqtt::inflight::OutInflightMessage;
 use rmqtt::macros::Plugin;
 use rmqtt::session::SessionState;
 use session::{Basic, StorageSessionManager, StoredSessionInfo, StoredSessionInfos};
-use session::{StoredKey, BASIC, DISCONNECT_INFO, INFLIGHT_MESSAGES, LAST_TIME, SESSION_SUB_MAP};
+use session::{
+    StoredKey, BASIC, DISCONNECT_INFO, INBOUND_QOS2_AWAIT_PUBREL, INFLIGHT_MESSAGES, LAST_TIME,
+    SESSION_SUB_MAP,
+};
 
 mod config;
 mod session;
@@ -204,6 +208,17 @@ impl StoragePlugin {
                         Ok(None) => {}
                         Err(e) => {
                             log::warn!("{id_key:?} load offline session inflight messages error, {e}");
+                        }
+                    }
+
+                    match m.get::<_, Vec<NonZeroU16>>(INBOUND_QOS2_AWAIT_PUBREL).await {
+                        Ok(Some(packet_ids)) => {
+                            log::debug!("inbound QoS2 awaiting PUBREL len: {}", packet_ids.len());
+                            s_info.inbound_qos2_await_pubrel = packet_ids;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            log::warn!("{id_key:?} load inbound QoS2 awaiting PUBREL packet ids error, {e}");
                         }
                     }
 
@@ -523,10 +538,12 @@ impl Handler for OfflineMessageHandler {
             }
 
             Parameter::OfflineInflightMessages(s, inflight_messages) => {
+                let inbound_qos2_await_pubrel = s.inbound_qos2_await_pubrel_snapshot().await;
                 log::debug!(
-                    "OfflineInflightMessages storage_type: {:?}, inflight_messages len: {:?}",
+                    "OfflineInflightMessages storage_type: {:?}, inflight_messages len: {:?}, inbound QoS2 awaiting PUBREL len: {:?}",
                     self.cfg.storage.typ,
                     inflight_messages.len(),
+                    inbound_qos2_await_pubrel.len(),
                 );
                 let map_stored_key = make_map_stored_key(s.id.to_string());
                 log::debug!("{:?} map_stored_key: {:?}", s.id, map_stored_key);
@@ -538,6 +555,9 @@ impl Handler for OfflineMessageHandler {
                     let m = storage_db.map(map_stored_key.as_ref(), None).await;
                     if let Err(e) = m.insert(INFLIGHT_MESSAGES, &inflight_messages).await {
                         log::warn!("{id:?} save offline inflight messages error, {e}")
+                    }
+                    if let Err(e) = m.insert(INBOUND_QOS2_AWAIT_PUBREL, &inbound_qos2_await_pubrel).await {
+                        log::warn!("{id:?} save inbound QoS2 awaiting PUBREL packet ids error, {e}")
                     }
                 });
             }
@@ -659,6 +679,10 @@ impl StorageHandler {
                         continue;
                     }
                 };
+
+                session
+                    .restore_inbound_qos2_await_pubrel(std::mem::take(&mut stored.inbound_qos2_await_pubrel))
+                    .await;
 
                 let deliver_queue = session.deliver_queue();
                 for item in stored.offline_messages.drain(..) {

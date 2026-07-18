@@ -407,44 +407,41 @@ async fn listen_wss(scx: ServerContext, l: &Listener, lid: ListenerId) {
 /// * `l` - QUIC listener configuration
 async fn listen_quic(scx: ServerContext, l: &Listener, lid: ListenerId) {
     loop {
-        match l.accept_quic().await {
-            Ok(mut accept) => {
+        match l.next_quic().await {
+            Ok(incoming) => {
                 let scx = scx.clone();
                 tokio::spawn(async move {
-                    let is_0rtt = accept.is_quic_0rtt();
-                    let handshake_complete = accept.take_quic_handshake_complete();
-                    log::debug!("QUIC connection from {}, 0-RTT stream: {}", accept.remote_addr, is_0rtt);
-
-                    let stream = match accept.quic().await {
-                        Ok(s) => s,
+                    let accepted = match incoming.accept_control().await {
+                        Ok(accepted) => accepted,
                         Err(e) => {
-                            log::warn!("QUIC accept error: {e}");
+                            log::warn!("QUIC control-flow verification failed: {e}");
                             return;
                         }
                     };
 
-                    let stream = match stream.mqtt().await {
-                        Ok(stream) => stream,
+                    let accepted = match accepted.mqtt().await {
+                        Ok(accepted) => accepted,
                         Err(e) => {
                             log::info!("MQTT/QUIC version detection failed: {e}");
                             return;
                         }
                     };
+                    let (stream, activation, meta) = accepted.into_parts();
 
-                    // CONNECT has already arrived in 0-RTT and is buffered by the MQTT codec.
-                    // Defer authentication and session mutations until TLS Finished is verified.
-                    if let Some(handshake_complete) = handshake_complete {
-                        handshake_complete.await;
-                    }
+                    log::debug!(
+                        "verified QUIC connection from {}, 0-RTT control flow: {}",
+                        meta.remote_addr,
+                        meta.is_0rtt
+                    );
 
                     match stream {
                         MqttStream::V3(s) => {
-                            if let Err(e) = v3::process(scx.clone(), s, lid).await {
+                            if let Err(e) = v3::process_quic(scx.clone(), s, activation, lid).await {
                                 log::info!("MQTTv3/QUIC processing error: {e}");
                             }
                         }
                         MqttStream::V5(s) => {
-                            if let Err(e) = v5::process(scx.clone(), s, lid).await {
+                            if let Err(e) = v5::process_quic(scx.clone(), s, activation, lid).await {
                                 log::info!("MQTTv5/QUIC processing error: {e}");
                             }
                         }

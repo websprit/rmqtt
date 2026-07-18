@@ -37,7 +37,7 @@ pub(crate) async fn subscribe(
     for sub in subs {
         let topic_filter = sub.topic_filter.clone();
         let (reply_tx, reply_rx) = oneshot::channel();
-        let send_reply = tx.unbounded_send(MqttMessage::Subscribe(sub, reply_tx));
+        let send_reply = tx.send(MqttMessage::Subscribe(sub, reply_tx)).await;
 
         let reply_fut = async move {
             let reply = if let Err(send_err) = send_reply {
@@ -69,7 +69,7 @@ pub(crate) async fn unsubscribe(scx: &ServerContext, params: UnsubscribeParams) 
     let tx = entry.tx().ok_or_else(|| anyhow!("session message TX is not exist!"))?;
     let unsub = Unsubscribe::from(&topic_filter, shared_subs, limit_subs)?;
     let (reply_tx, reply_rx) = oneshot::channel();
-    tx.unbounded_send(MqttMessage::Unsubscribe(unsub, reply_tx)).map_err(anyhow::Error::new)?;
+    tx.send(MqttMessage::Unsubscribe(unsub, reply_tx)).await.map_err(|e| anyhow!(e.to_string()))?;
     reply_rx.await.map_err(anyhow::Error::new)??;
     Ok(())
 }

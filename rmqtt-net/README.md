@@ -76,7 +76,7 @@ All fields have `pub` visibility and fluent setter methods:
 | `.proxy_protocol(v)` | `bool` | `false` |
 | `.proxy_protocol_timeout(d)` | `Duration` | `5s` |
 | `.idle_timeout(d)` | `Duration` | `90s` |
-| `.enable_quic_0rtt(v)` | `bool` | `false`; accepts replay-sensitive early data and is incompatible with mutual TLS |
+| `.enable_quic_0rtt(v)` | `bool` | `false`; enables handshake-gated CONNECT transport with single-use stateful tickets and is incompatible with mutual TLS |
 | `.bind(self) -> Result<Listener>` | — | Binds TCP socket, returns Listener |
 | `.bind_quic(self) -> Result<Listener>` | — | `#[cfg(feature = "quic")]` QUIC bind |
 
@@ -85,6 +85,7 @@ All fields have `pub` visibility and fluent setter methods:
 ```rust
 listener.accept().await? -> Acceptor<S>
 listener.accept_quic().await? -> Acceptor<QuinnBiStream>  // #[cfg(feature = "quic")]
+listener.next_quic().await?.accept_control().await?.mqtt() // verified typestate path
 listener.local_addr() -> Result<SocketAddr>
 ```
 
@@ -102,7 +103,7 @@ listener.wss()?  -> Listener  // #[cfg(feature = "tls")] #[cfg(feature = "ws")]
 acceptor.tcp() -> Result<Dispatcher<S>>           // create TCP dispatcher
 acceptor.tls() -> Result<Dispatcher<TlsStream<S>>> // #[cfg(feature = "tls")] TLS handshake + dispatcher
 acceptor.is_quic_0rtt() -> bool                    // #[cfg(feature = "quic")] early stream marker
-acceptor.take_quic_handshake_complete()            // await before applying MQTT session side effects
+// accept_quic() returns only after the QUIC/TLS Finished barrier has been verified
 acceptor.remote_addr: SocketAddr                   // client address
 ```
 

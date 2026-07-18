@@ -326,10 +326,27 @@ listener.quic.external.addr = "0.0.0.0:9443"
 #quic max_idle_timeout, default value: 90s
 listener.quic.external.idle_timeout = "120s"
 
-#Accept MQTT CONNECT as QUIC/TLS 1.3 early data on resumed sessions.
-#Disabled by default because early data has weaker replay guarantees.
-#Cannot be combined with cross_certificate=true (mutual TLS).
+#Legacy compatibility switch. New deployments should configure zero_rtt.mode below.
 listener.quic.external.enable_0rtt = false
+
+#Handshake-gated 0-RTT profile. Enabling requires an explicit credential profile.
+#Allowed profiles: "anonymous" (requires allow_anonymous=true) or
+#"short_lived_token" (requires allow_anonymous=false). Mutual TLS is unsupported.
+listener.quic.external.zero_rtt.mode = "disabled"
+listener.quic.external.zero_rtt.credential_profile = "deny"
+listener.quic.external.zero_rtt.auth_policy_epoch = 0
+listener.quic.external.zero_rtt.ticket_capacity = 4096
+listener.quic.external.zero_rtt.ticket_ttl = "10m"
+listener.quic.external.zero_rtt.pre_finished_read_budget = "64KB"
+
+#Optional RMQTT Simple Multistream profile. MQTT 5 clients request simple-v1 in CONNECT;
+#MQTT 3.1.1 requires this dedicated listener to be preconfigured on both sides.
+listener.quic.external.multistream.mode = "disabled"
+listener.quic.external.multistream.max_data_streams = 8
+listener.quic.external.multistream.stream_open_rate = 32
+listener.quic.external.multistream.stream_idle_timeout = "60s"
+listener.quic.external.multistream.connection_mailbox_packets = 256
+listener.quic.external.multistream.connection_buffer_bytes = "1MB"
 
 #Whether to enable cross-certification, default value: false
 listener.quic.external.cross_certificate = false

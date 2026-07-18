@@ -26,13 +26,12 @@ use crate::codec::v3::{
 };
 use crate::codec::v5::{
     Connect as ConnectV5, ConnectAckReason as ConnectAckReasonV5, DisconnectReasonCode,
-    LastWill as LastWillV5, PublishAck as PublishAckV5, PublishAck2, PublishAck2Reason, PublishAckReason,
-    PublishProperties, RetainHandling, SubscribeAckReason, SubscriptionOptions as SubscriptionOptionsV5,
-    ToReasonCode, UserProperties, UserProperty,
+    LastWill as LastWillV5, PublishAckReason, PublishProperties, RetainHandling, SubscribeAckReason,
+    SubscriptionOptions as SubscriptionOptionsV5, ToReasonCode, UserProperties, UserProperty,
 };
 use crate::fitter::Fitter;
+use crate::net::Builder;
 use crate::net::MqttError;
-use crate::net::{v3, v5, Builder};
 use crate::queue::{Queue, Sender};
 use crate::utils::{self, timestamp_millis};
 use crate::{codec, Error, Result};
@@ -41,7 +40,6 @@ use base64::prelude::{Engine, BASE64_STANDARD};
 use bitflags::bitflags;
 use bytes::Bytes;
 use bytestring::ByteString;
-use futures::StreamExt;
 use get_size2::GetSize;
 use itertools::Itertools;
 use rmqtt_codec::cert::CertInfo;
@@ -49,11 +47,10 @@ use serde::de::{self, Deserializer};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{oneshot, RwLock};
 
 use crate::context::ServerContext;
-use crate::inflight::{OutInflight, OutInflightMessage};
+use crate::inflight::{InInflight, OutInflight};
 use crate::session::OfflineInfo;
 use crate::topic::Level;
 
@@ -89,7 +86,7 @@ pub type AssignedClientId = bool;
 pub type IsPing = bool;
 
 pub type Tx = SessionTx;
-pub type Rx = futures::channel::mpsc::UnboundedReceiver<Message>;
+pub(crate) type Rx = tokio::sync::mpsc::Receiver<Message>;
 
 pub type DashSet<V> = dashmap::DashSet<V, ahash::RandomState>;
 pub type DashMap<K, V> = dashmap::DashMap<K, V, ahash::RandomState>;
@@ -109,6 +106,7 @@ pub type MessageSender = Sender<(From, Publish)>;
 pub type MessageQueue = Queue<(From, Publish)>;
 pub type MessageQueueType = Arc<MessageQueue>;
 pub type OutInflightType = Arc<RwLock<OutInflight>>; //@TODO Consider removing RwLock wrapper
+pub(crate) type InInflightType = Arc<RwLock<InInflight>>;
 
 pub type ConnectInfoType = Arc<ConnectInfo>;
 pub type FitterType = Arc<dyn Fitter>;
@@ -117,20 +115,74 @@ pub type ListenerId = u16;
 
 pub(crate) const UNDEFINED: &str = "undefined";
 
+/// Minimum session mailbox capacity reserved for CONNECT-time bootstrap control messages.
+pub(crate) const MIN_SESSION_MAILBOX_CAPACITY: usize = 16;
+
 /// A sender for delivering messages to a specific MQTT session.
 ///
-/// Wraps an unbounded MPSC sender with optional debug statistics tracking.
+/// Wraps a bounded MPSC sender with optional debug statistics tracking.
 /// When the `debug` feature is enabled, each send increments a session channel counter.
 #[derive(Clone)]
 pub struct SessionTx {
     #[cfg(feature = "debug")]
     scx: ServerContext,
-    tx: futures::channel::mpsc::UnboundedSender<Message>,
+    tx: tokio::sync::mpsc::Sender<Message>,
+}
+
+/// Bounded session mailbox send failure.
+#[derive(Debug)]
+pub enum SessionTrySendError {
+    /// The session mailbox is at capacity and the message was not queued.
+    Full(Box<Message>),
+    /// The session mailbox receiver has closed and the message was not queued.
+    Closed(Box<Message>),
+}
+
+impl SessionTrySendError {
+    /// Returns true when the message was rejected because the mailbox is full.
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        matches!(self, Self::Full(_))
+    }
+
+    /// Returns true when the message was rejected because the mailbox receiver is closed.
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        matches!(self, Self::Closed(_))
+    }
+
+    /// Returns the message that could not be queued.
+    #[inline]
+    pub fn into_inner(self) -> Message {
+        match self {
+            Self::Full(msg) | Self::Closed(msg) => *msg,
+        }
+    }
+}
+
+impl Display for SessionTrySendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full(_) => write!(f, "session mailbox is full"),
+            Self::Closed(_) => write!(f, "session mailbox is closed"),
+        }
+    }
+}
+
+impl std::error::Error for SessionTrySendError {}
+
+impl std::convert::From<tokio::sync::mpsc::error::TrySendError<Message>> for SessionTrySendError {
+    fn from(error: tokio::sync::mpsc::error::TrySendError<Message>) -> Self {
+        match error {
+            tokio::sync::mpsc::error::TrySendError::Full(msg) => Self::Full(Box::new(msg)),
+            tokio::sync::mpsc::error::TrySendError::Closed(msg) => Self::Closed(Box::new(msg)),
+        }
+    }
 }
 
 impl SessionTx {
-    pub fn new(
-        tx: futures::channel::mpsc::UnboundedSender<Message>,
+    pub(crate) fn new(
+        tx: tokio::sync::mpsc::Sender<Message>,
         #[cfg(feature = "debug")] scx: ServerContext,
     ) -> Self {
         Self {
@@ -141,23 +193,107 @@ impl SessionTx {
     }
 
     #[inline]
-    pub fn is_closed(&self) -> bool {
+    pub(crate) fn is_closed(&self) -> bool {
         self.tx.is_closed()
     }
 
     #[inline]
-    pub fn unbounded_send(
-        &self,
-        msg: Message,
-    ) -> std::result::Result<(), futures::channel::mpsc::TrySendError<Message>> {
-        match self.tx.unbounded_send(msg) {
+    pub(crate) fn mailbox_capacity(max_mqueue_len: usize) -> usize {
+        max_mqueue_len.max(MIN_SESSION_MAILBOX_CAPACITY)
+    }
+
+    #[inline]
+    pub(crate) fn try_send(&self, msg: Message) -> std::result::Result<(), SessionTrySendError> {
+        match self.tx.try_send(msg) {
             Ok(()) => {
                 #[cfg(feature = "debug")]
                 self.scx.stats.debug_session_channels.inc();
                 Ok(())
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
+    }
+
+    /// Sends a message to the session mailbox, waiting until bounded capacity is available.
+    ///
+    /// Use this for control or safety-sensitive messages that must not be dropped when the
+    /// session mailbox is temporarily full. The returned future completes only after the
+    /// message is queued or the session mailbox receiver closes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`tokio::sync::mpsc::error::SendError`] with the original message when the
+    /// session mailbox receiver has closed before the message could be queued.
+    #[inline]
+    pub async fn send(
+        &self,
+        msg: Message,
+    ) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<Message>> {
+        self.tx.send(msg).await?;
+        #[cfg(feature = "debug")]
+        self.scx.stats.debug_session_channels.inc();
+        Ok(())
+    }
+
+    /// Compatibility alias for the previous unbounded session mailbox API.
+    ///
+    /// This is bounded and fallible: callers must handle `is_full()` as backpressure and
+    /// `is_closed()` as a closed session.
+    #[inline]
+    pub fn unbounded_send(&self, msg: Message) -> std::result::Result<(), SessionTrySendError> {
+        self.try_send(msg)
+    }
+}
+
+#[cfg(all(test, not(feature = "debug")))]
+mod session_tx_tests {
+    use super::*;
+
+    fn closed_message() -> Message {
+        Message::Closed(Reason::from_static("test"))
+    }
+
+    #[test]
+    fn mailbox_capacity_uses_listener_limit_with_bootstrap_floor() {
+        assert_eq!(SessionTx::mailbox_capacity(0), MIN_SESSION_MAILBOX_CAPACITY);
+        assert_eq!(
+            SessionTx::mailbox_capacity(MIN_SESSION_MAILBOX_CAPACITY - 1),
+            MIN_SESSION_MAILBOX_CAPACITY
+        );
+        assert_eq!(
+            SessionTx::mailbox_capacity(MIN_SESSION_MAILBOX_CAPACITY + 1),
+            MIN_SESSION_MAILBOX_CAPACITY + 1
+        );
+    }
+
+    #[test]
+    fn try_send_reports_full_and_closed_mailbox() {
+        let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel(1);
+        let tx = SessionTx::new(raw_tx);
+
+        tx.try_send(closed_message()).expect("first send should fit");
+        assert!(matches!(tx.try_send(closed_message()), Err(SessionTrySendError::Full(_))));
+
+        raw_rx.close();
+        assert!(raw_rx.blocking_recv().is_some());
+        assert!(matches!(tx.try_send(closed_message()), Err(SessionTrySendError::Closed(_))));
+    }
+
+    #[tokio::test]
+    async fn control_send_waits_for_capacity_and_fails_when_closed() {
+        let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel(1);
+        let tx = SessionTx::new(raw_tx);
+
+        tx.try_send(closed_message()).expect("first send should fit");
+        assert!(tokio::time::timeout(Duration::from_millis(20), tx.send(closed_message())).await.is_err());
+        assert!(raw_rx.recv().await.is_some());
+        assert!(tokio::time::timeout(Duration::from_millis(20), tx.send(closed_message()))
+            .await
+            .expect("send should complete before timeout")
+            .is_ok());
+
+        drop(raw_rx);
+        assert!(tx.send(closed_message()).await.is_err());
     }
 }
 
@@ -1378,174 +1514,6 @@ impl<'a> std::convert::TryFrom<LastWill<'a>> for Publish {
     }
 }
 
-pub enum Sink<Io> {
-    V3(v3::MqttStream<Io>),
-    V5(v5::MqttStream<Io>),
-}
-
-impl<Io> Sink<Io>
-where
-    Io: AsyncRead + AsyncWrite + Unpin,
-{
-    #[inline]
-    pub(crate) fn v3_mut(&mut self) -> &mut v3::MqttStream<Io> {
-        if let Sink::V3(s) = self {
-            s
-        } else {
-            unreachable!()
-        }
-    }
-
-    #[inline]
-    pub(crate) fn v5_mut(&mut self) -> &mut v5::MqttStream<Io> {
-        if let Sink::V5(s) = self {
-            s
-        } else {
-            unreachable!()
-        }
-    }
-
-    #[inline]
-    pub(crate) async fn recv(&mut self) -> Result<Option<Packet>> {
-        match self {
-            Sink::V3(s) => match s.next().await {
-                Some(Ok(pkt)) => Ok(Some(Packet::V3(pkt))),
-                Some(Err(e)) => Err(e),
-                None => Ok(None),
-            },
-            Sink::V5(s) => match s.next().await {
-                Some(Ok(pkt)) => Ok(Some(Packet::V5(pkt))),
-                Some(Err(e)) => Err(e),
-                None => Ok(None),
-            },
-        }
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) async fn close(&mut self) -> Result<()> {
-        match self {
-            Sink::V3(s) => {
-                s.close().await?;
-            }
-            Sink::V5(s) => s.close().await?,
-        }
-        Ok(())
-    }
-
-    #[inline]
-    pub(crate) async fn publish(
-        &mut self,
-        mut p: Publish,
-        message_expiry_interval: Option<NonZeroU32>,
-        server_topic_aliases: Option<&Arc<ServerTopicAliases>>,
-    ) -> Result<()> {
-        match self {
-            Sink::V3(s) => {
-                s.send_publish(p.take()).await?;
-            }
-            Sink::V5(s) => {
-                let (topic, alias) = {
-                    if let Some(server_topic_aliases) = server_topic_aliases {
-                        server_topic_aliases.get(p.topic.clone()).await
-                    } else {
-                        (Some(p.topic.clone()), None)
-                    }
-                };
-
-                p.topic = topic.unwrap_or_default();
-
-                if let Some(properties) = &mut p.properties {
-                    properties.message_expiry_interval = message_expiry_interval;
-                    properties.topic_alias = alias;
-                }
-                s.send_publish(p.take()).await?;
-            }
-        }
-        Ok(())
-    }
-
-    #[inline]
-    pub(crate) async fn send_publish_ack(
-        &mut self,
-        packet_id: NonZeroU16,
-        pubres: PublishResult,
-    ) -> Result<()> {
-        match self {
-            Sink::V3(s) => {
-                s.send_publish_ack(packet_id).await?;
-            }
-            Sink::V5(s) => {
-                let ack = PublishAckV5 {
-                    packet_id,
-                    reason_code: pubres.reason_code,
-                    properties: pubres.properties,
-                    reason_string: pubres.reason_string,
-                };
-                s.send_publish_ack(ack).await?;
-            }
-        }
-        Ok(())
-    }
-
-    #[inline]
-    pub(crate) async fn send_publish_received(
-        &mut self,
-        packet_id: NonZeroU16,
-        pubres: PublishResult,
-    ) -> Result<()> {
-        match self {
-            Sink::V3(s) => {
-                s.send_publish_received(packet_id).await?;
-            }
-            Sink::V5(s) => {
-                let ack = PublishAckV5 {
-                    packet_id,
-                    reason_code: pubres.reason_code,
-                    properties: pubres.properties,
-                    reason_string: pubres.reason_string,
-                };
-                s.send_publish_received(ack).await?;
-            }
-        }
-        Ok(())
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) async fn send_publish_release(&mut self, packet_id: NonZeroU16) -> Result<()> {
-        match self {
-            Sink::V3(s) => {
-                s.send_publish_release(packet_id).await?;
-            }
-            Sink::V5(s) => {
-                let ack2 =
-                    PublishAck2 { packet_id, reason_code: PublishAck2Reason::Success, ..Default::default() };
-                s.send_publish_release(ack2).await?;
-            }
-        }
-        Ok(())
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) async fn send(&mut self, p: Packet) -> Result<()> {
-        match self {
-            Sink::V3(s) => {
-                if let Packet::V3(p) = p {
-                    s.send(p).await?;
-                }
-            }
-            Sink::V5(s) => {
-                if let Packet::V5(p) = p {
-                    s.send(p).await?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
 /// Result of processing a PUBLISH packet.
 ///
 /// Contains the reason code, optional reason string, user properties,
@@ -1986,12 +1954,11 @@ impl StoredMessage {
 
 /// An internal message sent between broker components.
 ///
-/// Variants cover message forwarding, inflight re-delivery, session kicks,
-/// connection close notifications, subscription changes, and state transfer.
+/// Variants cover message forwarding, session kicks, connection close notifications,
+/// subscription changes, and state transfer.
 #[derive(Debug)]
 pub enum Message {
     Forward(From, Publish),
-    SendRerelease(OutInflightMessage),
     Kick(oneshot::Sender<()>, Id, CleanStart, IsAdmin),
     // Disconnect(Disconnect),
     Closed(Reason),

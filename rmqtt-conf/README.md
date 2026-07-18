@@ -148,7 +148,9 @@ Fields via `Deref<Target = ListenerInner>`:
 | `cert_subject_dn_as_username` | `bool` | `false` | Use TLS subject DN as username |
 | `collect_cert_info` | `bool` | `false` | Collect TLS cert info |
 | `idle_timeout` | `Duration` | `90s` | QUIC idle timeout |
-| `enable_0rtt` | `bool` | `false` | Accept MQTT CONNECT during resumed QUIC handshakes; incompatible with mutual TLS |
+| `enable_0rtt` | `bool` | `false` | Legacy QUIC 0-RTT switch; new deployments should use `zero_rtt.mode` |
+| `zero_rtt` | `ZeroRtt` | disabled/deny | Handshake-gated single-use ticket policy, credential profile, TTL/capacity, auth epoch and pre-Finished transport budget |
+| `multistream` | `Multistream` | disabled | Simple-v1 mode, stream count/rate/idle limits, packet mailbox and aggregate byte budget |
 
 ### `Plugins` — plugin config loading
 

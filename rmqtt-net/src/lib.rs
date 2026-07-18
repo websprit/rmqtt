@@ -29,18 +29,38 @@
 mod builder;
 mod cert_extractor;
 mod error;
+mod link;
+mod memory_link;
 #[cfg(feature = "quic")]
 mod quic;
+#[cfg(feature = "quic")]
+mod quic_link;
+#[cfg(feature = "quic")]
+mod quic_session_store;
 mod stream;
 #[cfg(feature = "ws")]
 mod ws;
 
 /// QUIC bidirectional stream type for MQTT over QUIC transport
 #[cfg(feature = "quic")]
-pub use quic::QuinnBiStream;
+pub use quic::{
+    AcceptedQuicControl, AcceptedQuicMqtt, ConnackCommitted, QuicActivation, QuicIncoming, QuicIngressMeta,
+    QuinnBiStream,
+};
+#[cfg(feature = "quic")]
+pub use quic_link::QuicMultiStreamLink;
+#[cfg(feature = "quic")]
+pub use quic_session_store::{ReplaySafeServerSessionStore, ZeroRttProfileFingerprint};
 
 /// Server configuration and listener management
 pub use builder::{Builder, Listener, ListenerType};
+
+/// Transport-neutral MQTT connection and logical-flow abstraction.
+pub use link::{
+    ConnectionCloseReason, FlowCloseReason, FlowId, FlowKind, LinkEvent, MqttLink, ReplyPath, SendReceipt,
+    SendTarget, SerialMqttLink,
+};
+pub use memory_link::{ClosedEvent, MemoryMqttLink, MemoryMqttLinkHandle, SentPacket};
 
 /// Trait for extracting TLS certificate information from client connections
 pub use cert_extractor::TlsCertExtractor;

@@ -35,7 +35,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(feature = "quic")]
-use crate::quic::QuinnBiStream;
+use crate::quic::{QuicIncoming, QuinnBiStream};
+#[cfg(feature = "quic")]
+use crate::quic_session_store::{ReplaySafeServerSessionStore, ZeroRttProfileFingerprint};
 use crate::stream::Dispatcher;
 #[cfg(feature = "ws")]
 use crate::ws::WsStream;
@@ -49,7 +51,7 @@ use proxy_protocol::parse;
 use proxy_protocol::ProxyHeader;
 use proxy_protocol::{version1 as v1, version2 as v2};
 #[cfg(feature = "quic")]
-use quinn::{crypto::rustls::QuicServerConfig, IdleTimeout};
+use quinn::{crypto::rustls::QuicServerConfig, IdleTimeout, VarInt};
 #[cfg(feature = "tls")]
 use rmqtt_codec::cert::CertInfo;
 use rmqtt_codec::types::QoS;
@@ -66,6 +68,8 @@ use rustls::{pki_types::pem::PemObject, server::WebPkiClientVerifier, RootCertSt
 use socket2::{Domain, SockAddr, Socket, Type};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
+#[cfg(feature = "quic")]
+use tokio::sync::Semaphore;
 #[cfg(feature = "tls")]
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
 #[cfg(feature = "ws")]
@@ -73,6 +77,68 @@ use tokio_tungstenite::{
     accept_hdr_async,
     tungstenite::handshake::server::{ErrorResponse, Request, Response},
 };
+
+/// QUIC 0-RTT operating mode for resumed connections.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ZeroRttMode {
+    /// Disable QUIC 0-RTT and require all MQTT data to wait for a full handshake.
+    #[default]
+    Disabled,
+    /// Accept early data only through the resumed-handshake completion gate.
+    HandshakeGated,
+}
+
+impl ZeroRttMode {
+    /// Returns the configuration string for this 0-RTT mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::HandshakeGated => "handshake_gated",
+        }
+    }
+}
+
+impl From<&str> for ZeroRttMode {
+    fn from(value: &str) -> Self {
+        match value {
+            "handshake_gated" => Self::HandshakeGated,
+            _ => Self::Disabled,
+        }
+    }
+}
+
+/// Credential policy required before QUIC 0-RTT can be enabled.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ZeroRttCredentialProfile {
+    /// Reject QUIC 0-RTT until a concrete credential profile is configured.
+    #[default]
+    Deny,
+    /// Allow 0-RTT for listeners that explicitly allow anonymous MQTT clients.
+    Anonymous,
+    /// Allow 0-RTT for listeners that require short-lived client credentials.
+    ShortLivedToken,
+}
+
+impl ZeroRttCredentialProfile {
+    /// Returns the configuration string for this credential profile.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Anonymous => "anonymous",
+            Self::ShortLivedToken => "short_lived_token",
+        }
+    }
+}
+
+impl From<&str> for ZeroRttCredentialProfile {
+    fn from(value: &str) -> Self {
+        match value {
+            "anonymous" => Self::Anonymous,
+            "short_lived_token" => Self::ShortLivedToken,
+            _ => Self::Deny,
+        }
+    }
+}
 
 /// Configuration builder for MQTT server instances
 #[derive(Clone, Debug)]
@@ -170,7 +236,34 @@ pub struct Builder {
     /// QUIC(max_idle_timeout)
     pub idle_timeout: Duration,
     /// Accept MQTT application data during a resumed QUIC handshake.
+    ///
+    /// Enabling this also selects `ZeroRttMode::HandshakeGated` unless an
+    /// explicit mode was already configured.
     pub enable_quic_0rtt: bool,
+    /// QUIC 0-RTT operating mode used for resumed connections.
+    pub quic_0rtt_mode: ZeroRttMode,
+    /// Credential profile that must match listener authentication policy before 0-RTT is allowed.
+    pub quic_0rtt_credential_profile: ZeroRttCredentialProfile,
+    /// Authentication policy epoch included in ticket fingerprints to invalidate old tickets.
+    pub quic_0rtt_auth_policy_epoch: u64,
+    /// Capacity of the stateful, single-use QUIC 0-RTT ticket cache.
+    pub quic_0rtt_ticket_capacity: usize,
+    /// Time-to-live for cached QUIC 0-RTT tickets.
+    pub quic_0rtt_ticket_ttl: Duration,
+    /// Bytes accepted before the resumed QUIC handshake finishes.
+    pub quic_0rtt_pre_finished_read_budget: u32,
+    /// QUIC multistream mode string, currently `disabled` or `simple`.
+    pub multistream_mode: String,
+    /// Maximum concurrent MQTT data streams allowed after QUIC multistream activation.
+    pub multistream_max_data_streams: u32,
+    /// Maximum MQTT data-stream open rate allowed after QUIC multistream activation.
+    pub multistream_stream_open_rate: u32,
+    /// MQTT data-stream idle timeout after QUIC multistream activation.
+    pub multistream_stream_idle_timeout: Duration,
+    /// Packets queued per QUIC multistream connection.
+    pub multistream_connection_mailbox_packets: usize,
+    /// Buffered bytes allowed per QUIC multistream connection.
+    pub multistream_connection_buffer_bytes: usize,
 }
 
 impl Default for Builder {
@@ -240,6 +333,18 @@ impl Builder {
 
             idle_timeout: Duration::from_secs(90),
             enable_quic_0rtt: false,
+            quic_0rtt_mode: ZeroRttMode::Disabled,
+            quic_0rtt_credential_profile: ZeroRttCredentialProfile::Deny,
+            quic_0rtt_auth_policy_epoch: 0,
+            quic_0rtt_ticket_capacity: 4096,
+            quic_0rtt_ticket_ttl: Duration::from_secs(10 * 60),
+            quic_0rtt_pre_finished_read_budget: 64 * 1024,
+            multistream_mode: "disabled".into(),
+            multistream_max_data_streams: 8,
+            multistream_stream_open_rate: 32,
+            multistream_stream_idle_timeout: Duration::from_secs(60),
+            multistream_connection_mailbox_packets: 256,
+            multistream_connection_buffer_bytes: 1024 * 1024,
         }
     }
 
@@ -485,8 +590,89 @@ impl Builder {
     }
 
     /// Enables TLS 1.3 early data and immediate stream acceptance for resumed QUIC connections.
+    ///
+    /// When enabled, `bind_quic` requires a non-deny credential profile and
+    /// uses stateful, single-use tickets to guard replay-sensitive MQTT data.
     pub fn enable_quic_0rtt(mut self, enable_quic_0rtt: bool) -> Self {
         self.enable_quic_0rtt = enable_quic_0rtt;
+        if enable_quic_0rtt && self.quic_0rtt_mode == ZeroRttMode::Disabled {
+            self.quic_0rtt_mode = ZeroRttMode::HandshakeGated;
+        } else if !enable_quic_0rtt {
+            self.quic_0rtt_mode = ZeroRttMode::Disabled;
+        }
+        self
+    }
+
+    /// Configures QUIC 0-RTT mode from its configuration string.
+    pub fn quic_0rtt_mode<N: AsRef<str>>(mut self, mode: N) -> Self {
+        self.quic_0rtt_mode = ZeroRttMode::from(mode.as_ref());
+        self.enable_quic_0rtt = self.quic_0rtt_mode == ZeroRttMode::HandshakeGated;
+        self
+    }
+
+    /// Configures the QUIC 0-RTT credential policy from its configuration string.
+    pub fn quic_0rtt_credential_profile<N: AsRef<str>>(mut self, profile: N) -> Self {
+        self.quic_0rtt_credential_profile = ZeroRttCredentialProfile::from(profile.as_ref());
+        self
+    }
+
+    /// Configures the QUIC 0-RTT auth-policy epoch used to invalidate old tickets.
+    pub fn quic_0rtt_auth_policy_epoch(mut self, auth_policy_epoch: u64) -> Self {
+        self.quic_0rtt_auth_policy_epoch = auth_policy_epoch;
+        self
+    }
+
+    /// Configures the QUIC 0-RTT stateful, single-use ticket cache capacity.
+    pub fn quic_0rtt_ticket_capacity(mut self, ticket_capacity: usize) -> Self {
+        self.quic_0rtt_ticket_capacity = ticket_capacity;
+        self
+    }
+
+    /// Configures the QUIC 0-RTT stateful ticket cache TTL.
+    pub fn quic_0rtt_ticket_ttl(mut self, ticket_ttl: Duration) -> Self {
+        self.quic_0rtt_ticket_ttl = ticket_ttl;
+        self
+    }
+
+    /// Configures bytes accepted before the resumed QUIC handshake finishes.
+    pub fn quic_0rtt_pre_finished_read_budget(mut self, pre_finished_read_budget: u32) -> Self {
+        self.quic_0rtt_pre_finished_read_budget = pre_finished_read_budget;
+        self
+    }
+
+    /// Configures QUIC multistream mode from its configuration string.
+    pub fn multistream_mode<N: Into<String>>(mut self, mode: N) -> Self {
+        self.multistream_mode = mode.into();
+        self
+    }
+
+    /// Configures maximum MQTT data streams per QUIC connection.
+    pub fn multistream_max_data_streams(mut self, max_data_streams: u32) -> Self {
+        self.multistream_max_data_streams = max_data_streams.min(u32::MAX - 1);
+        self
+    }
+
+    /// Configures the MQTT data-stream open rate per QUIC connection.
+    pub fn multistream_stream_open_rate(mut self, stream_open_rate: u32) -> Self {
+        self.multistream_stream_open_rate = stream_open_rate;
+        self
+    }
+
+    /// Configures the MQTT data-stream idle timeout for QUIC multistream sessions.
+    pub fn multistream_stream_idle_timeout(mut self, stream_idle_timeout: Duration) -> Self {
+        self.multistream_stream_idle_timeout = stream_idle_timeout;
+        self
+    }
+
+    /// Configures packets queued per QUIC multistream connection.
+    pub fn multistream_connection_mailbox_packets(mut self, connection_mailbox_packets: usize) -> Self {
+        self.multistream_connection_mailbox_packets = connection_mailbox_packets;
+        self
+    }
+
+    /// Configures buffered bytes allowed per QUIC multistream connection.
+    pub fn multistream_connection_buffer_bytes(mut self, connection_buffer_bytes: usize) -> Self {
+        self.multistream_connection_buffer_bytes = connection_buffer_bytes;
         self
     }
 
@@ -518,6 +704,8 @@ impl Builder {
             self.name,
             tcp_listener.local_addr().unwrap_or(self.laddr)
         );
+        #[cfg(feature = "quic")]
+        let quic_handshake_permits = Arc::new(Semaphore::new(self.max_handshaking_limit.max(1)));
         Ok(Listener {
             typ: ListenerType::TCP,
             cfg: Arc::new(self),
@@ -526,28 +714,76 @@ impl Builder {
             tls_acceptor: None,
             #[cfg(feature = "quic")]
             quinn_endpoint: None,
+            #[cfg(feature = "quic")]
+            quic_handshake_permits,
         })
     }
 
     #[allow(unused_variables)]
     #[cfg(feature = "quic")]
+    /// Binds a QUIC listener using the configured TLS, 0-RTT, and multistream policy.
+    ///
+    /// 0-RTT requires a non-deny credential profile, stateful TLS tickets, and
+    /// an authentication policy that is compatible with the configured listener.
     pub fn bind_quic(self) -> Result<Listener> {
-        if self.enable_quic_0rtt && self.tls_cross_certificate {
+        let quic_0rtt_enabled = self.enable_quic_0rtt || self.quic_0rtt_mode == ZeroRttMode::HandshakeGated;
+        if quic_0rtt_enabled && self.quic_0rtt_credential_profile == ZeroRttCredentialProfile::Deny {
+            return Err(anyhow!("QUIC 0-RTT requires an explicit credential profile"));
+        }
+        if quic_0rtt_enabled && self.tls_cross_certificate {
             return Err(anyhow!("QUIC 0-RTT cannot be combined with mutual TLS authentication"));
+        }
+        if quic_0rtt_enabled
+            && self.quic_0rtt_credential_profile == ZeroRttCredentialProfile::Anonymous
+            && !self.allow_anonymous
+        {
+            return Err(anyhow!("QUIC 0-RTT anonymous credential profile requires an anonymous listener"));
+        }
+        if quic_0rtt_enabled
+            && self.quic_0rtt_credential_profile == ZeroRttCredentialProfile::ShortLivedToken
+            && self.allow_anonymous
+        {
+            return Err(anyhow!(
+                "QUIC 0-RTT short-lived token profile requires anonymous access to be disabled"
+            ));
         }
         let mut tls_config = self.build_tls_config()?;
         tls_config.alpn_protocols = vec![b"mqtt".to_vec(), b"mqttv5".to_vec()];
-        if self.enable_quic_0rtt {
+        if quic_0rtt_enabled {
+            if tls_config.ticketer.enabled() {
+                return Err(anyhow!("QUIC 0-RTT requires stateful TLS tickets"));
+            }
+            tls_config.send_half_rtt_data = false;
+            let profile = ZeroRttProfileFingerprint::mqtt_quic(
+                tls_config.alpn_protocols.iter().map(Vec::as_slice),
+                u64::from(self.quic_0rtt_pre_finished_read_budget),
+                self.quic_0rtt_auth_policy_epoch,
+                format!("{}:{}", self.quic_0rtt_credential_profile.as_str(), self.multistream_mode).as_str(),
+            );
+            tls_config.session_storage = ReplaySafeServerSessionStore::new(
+                self.quic_0rtt_ticket_capacity,
+                self.quic_0rtt_ticket_ttl,
+                profile,
+            );
+            // Quinn requires QUIC max early data to be either 0 or 2^32-1.
             tls_config.max_early_data_size = u32::MAX;
         }
         let server_crypto = QuicServerConfig::try_from(tls_config)?;
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
 
-        let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
+        let transport_config = Arc::get_mut(&mut server_config.transport)
+            .ok_or_else(|| anyhow!("QUIC transport config is unexpectedly shared"))?;
+        transport_config.max_concurrent_bidi_streams(1_u8.into());
         transport_config.max_concurrent_uni_streams(0_u8.into());
         transport_config.max_idle_timeout(Some(IdleTimeout::try_from(self.idle_timeout)?));
+        if quic_0rtt_enabled {
+            let pre_finished_budget = VarInt::from_u32(self.quic_0rtt_pre_finished_read_budget.max(1));
+            transport_config.stream_receive_window(pre_finished_budget);
+            transport_config.receive_window(pre_finished_budget);
+        }
 
         let endpoint = quinn::Endpoint::server(server_config, self.laddr)?;
+        let quic_handshake_permits = Arc::new(Semaphore::new(self.max_handshaking_limit.max(1)));
 
         log::info!("MQTT Broker Listening on {} {}", self.name, endpoint.local_addr().unwrap_or(self.laddr));
         Ok(Listener {
@@ -557,6 +793,7 @@ impl Builder {
             #[cfg(feature = "tls")]
             tls_acceptor: None,
             quinn_endpoint: Some(endpoint),
+            quic_handshake_permits,
         })
     }
 
@@ -626,6 +863,8 @@ pub struct Listener {
     tls_acceptor: Option<TlsAcceptor>,
     #[cfg(feature = "quic")]
     quinn_endpoint: Option<quinn::Endpoint>,
+    #[cfg(feature = "quic")]
+    quic_handshake_permits: Arc<Semaphore>,
 }
 
 /// # Examples
@@ -748,46 +987,49 @@ impl Listener {
             remote_addr,
             #[cfg(feature = "tls")]
             acceptor: self.tls_acceptor.clone(),
-            #[cfg(feature = "quic")]
-            quic_handshake_complete: None,
             cfg: self.cfg.clone(),
             typ: self.typ,
         })
     }
 
     #[cfg(feature = "quic")]
-    pub async fn accept_quic(&self) -> Result<Acceptor<QuinnBiStream>> {
-        if let Some(endpoint) = &self.quinn_endpoint {
-            let incoming =
-                endpoint.accept().await.ok_or_else(|| anyhow!("No incoming QUIC connection available"))?;
-            let (conn, quic_handshake_complete) = if self.cfg.enable_quic_0rtt {
-                let (conn, handshake_complete) = incoming
-                    .accept()?
-                    .into_0rtt()
-                    .map_err(|_| anyhow!("Failed to enable early stream processing for QUIC connection"))?;
-                (conn, Some(handshake_complete))
-            } else {
-                (incoming.await?, None)
-            };
-            let remote_addr = conn.remote_address();
-
-            let (send, recv) = conn.accept_bi().await?;
-            let socket = QuinnBiStream::new(send, recv);
-
-            Ok(Acceptor {
-                socket,
-                remote_addr,
-                #[cfg(feature = "tls")]
-                acceptor: self.tls_acceptor.clone(),
-                quic_handshake_complete,
-                cfg: self.cfg.clone(),
-                typ: self.typ,
-            })
-        } else {
-            Err(anyhow!(""))
-        }
+    /// Accepts the next QUIC connection and returns the typed incoming connection handle.
+    ///
+    /// The returned `QuicIncoming` lets callers choose the verified typestate
+    /// path, including control-stream activation and MQTT multistream handling.
+    pub async fn next_quic(&self) -> Result<QuicIncoming> {
+        let endpoint =
+            self.quinn_endpoint.as_ref().ok_or_else(|| anyhow!("No active QUIC endpoint available"))?;
+        let permit = self
+            .quic_handshake_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("QUIC handshake admission is closed"))?;
+        let incoming =
+            endpoint.accept().await.ok_or_else(|| anyhow!("No incoming QUIC connection available"))?;
+        QuicIncoming::new(incoming, self.cfg.clone(), permit)
     }
 
+    #[cfg(feature = "quic")]
+    /// Accepts the next QUIC connection and returns its MQTT control stream.
+    ///
+    /// This preserves the legacy single-stream accept path; new multistream
+    /// callers should use `next_quic` and complete activation explicitly.
+    pub async fn accept_quic(&self) -> Result<Acceptor<QuinnBiStream>> {
+        let accepted = self.next_quic().await?.accept_control().await?;
+        let (socket, meta, cfg) = accepted.into_legacy_parts();
+        Ok(Acceptor {
+            socket,
+            remote_addr: meta.remote_addr,
+            #[cfg(feature = "tls")]
+            acceptor: self.tls_acceptor.clone(),
+            cfg,
+            typ: self.typ,
+        })
+    }
+
+    /// Returns the bound local socket address for this listener.
     pub fn local_addr(&self) -> Result<SocketAddr> {
         if let Some(tcp_listener) = &self.tcp_listener {
             Ok(tcp_listener.local_addr()?)
@@ -810,8 +1052,6 @@ pub struct Acceptor<S> {
     pub(crate) socket: S,
     #[cfg(feature = "tls")]
     acceptor: Option<TlsAcceptor>,
-    #[cfg(feature = "quic")]
-    quic_handshake_complete: Option<quinn::ZeroRttAccepted>,
     /// Remote client address
     pub remote_addr: SocketAddr,
     /// Shared server configuration
@@ -825,11 +1065,6 @@ impl Acceptor<QuinnBiStream> {
     /// Returns whether the accepted QUIC stream was opened using 0-RTT data.
     pub fn is_quic_0rtt(&self) -> bool {
         self.socket.is_0rtt()
-    }
-
-    /// Takes the future that resolves when the QUIC/TLS handshake is fully authenticated.
-    pub fn take_quic_handshake_complete(&mut self) -> Option<quinn::ZeroRttAccepted> {
-        self.quic_handshake_complete.take()
     }
 }
 
@@ -1079,4 +1314,70 @@ fn read_ca_certs(cert_file: &str) -> Result<Vec<CertificateDer<'static>>> {
         .map_err(|e| anyhow!(e))?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| anyhow!(e))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{Builder, ZeroRttCredentialProfile, ZeroRttMode};
+
+    #[test]
+    fn builder_carries_default_and_bounded_multistream_config() {
+        let builder = Builder::new();
+
+        assert_eq!(builder.multistream_mode, "disabled");
+        assert_eq!(builder.multistream_max_data_streams, 8);
+        assert_eq!(builder.multistream_stream_open_rate, 32);
+        assert_eq!(builder.multistream_stream_idle_timeout, Duration::from_secs(60));
+        assert_eq!(builder.multistream_connection_mailbox_packets, 256);
+        assert_eq!(builder.multistream_connection_buffer_bytes, 1024 * 1024);
+
+        let builder = Builder::new()
+            .multistream_mode("simple")
+            .multistream_max_data_streams(u32::MAX)
+            .multistream_stream_open_rate(16)
+            .multistream_stream_idle_timeout(Duration::from_secs(30))
+            .multistream_connection_mailbox_packets(128)
+            .multistream_connection_buffer_bytes(512 * 1024);
+
+        assert_eq!(builder.multistream_mode, "simple");
+        assert_eq!(builder.multistream_max_data_streams, u32::MAX - 1);
+        assert_eq!(builder.multistream_stream_open_rate, 16);
+        assert_eq!(builder.multistream_stream_idle_timeout, Duration::from_secs(30));
+        assert_eq!(builder.multistream_connection_mailbox_packets, 128);
+        assert_eq!(builder.multistream_connection_buffer_bytes, 512 * 1024);
+    }
+
+    #[test]
+    fn builder_carries_default_zero_rtt_policy() {
+        let builder = Builder::new();
+
+        assert!(!builder.enable_quic_0rtt);
+        assert_eq!(builder.quic_0rtt_mode, ZeroRttMode::Disabled);
+        assert_eq!(builder.quic_0rtt_credential_profile, ZeroRttCredentialProfile::Deny);
+        assert_eq!(builder.quic_0rtt_auth_policy_epoch, 0);
+        assert_eq!(builder.quic_0rtt_ticket_capacity, 4096);
+        assert_eq!(builder.quic_0rtt_ticket_ttl, Duration::from_secs(10 * 60));
+        assert_eq!(builder.quic_0rtt_pre_finished_read_budget, 64 * 1024);
+    }
+
+    #[test]
+    fn builder_configures_zero_rtt_policy() {
+        let builder = Builder::new()
+            .quic_0rtt_mode("handshake_gated")
+            .quic_0rtt_credential_profile("short_lived_token")
+            .quic_0rtt_auth_policy_epoch(9)
+            .quic_0rtt_ticket_capacity(128)
+            .quic_0rtt_ticket_ttl(Duration::from_secs(30))
+            .quic_0rtt_pre_finished_read_budget(32 * 1024);
+
+        assert!(builder.enable_quic_0rtt);
+        assert_eq!(builder.quic_0rtt_mode, ZeroRttMode::HandshakeGated);
+        assert_eq!(builder.quic_0rtt_credential_profile, ZeroRttCredentialProfile::ShortLivedToken);
+        assert_eq!(builder.quic_0rtt_auth_policy_epoch, 9);
+        assert_eq!(builder.quic_0rtt_ticket_capacity, 128);
+        assert_eq!(builder.quic_0rtt_ticket_ttl, Duration::from_secs(30));
+        assert_eq!(builder.quic_0rtt_pre_finished_read_budget, 32 * 1024);
+    }
 }

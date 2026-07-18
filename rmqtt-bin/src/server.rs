@@ -19,7 +19,7 @@ use rmqtt::net::{tls_provider, Builder};
 use rmqtt::node::Node;
 use rmqtt::server::MqttServer;
 use rmqtt::Result;
-use rmqtt_conf::{listener::Listener, Options, Settings};
+use rmqtt_conf::{listener::ListenerInner, Options, Settings};
 
 mod logger;
 
@@ -207,7 +207,7 @@ async fn run() -> Result<()> {
     std::process::exit(0);
 }
 
-fn config_builder(cfg: &Listener) -> Builder {
+fn config_builder(cfg: &ListenerInner) -> Builder {
     Builder::new()
         .name(cfg.name.as_str())
         .laddr(cfg.addr)
@@ -248,7 +248,69 @@ fn config_builder(cfg: &Listener) -> Builder {
         .cert_subject_dn_as_username(cfg.cert_subject_dn_as_username)
         .collect_cert_info(cfg.collect_cert_info)
         .idle_timeout(cfg.idle_timeout)
-        .enable_quic_0rtt(cfg.enable_0rtt)
+        .quic_0rtt_mode(cfg.zero_rtt.mode.as_str())
+        .enable_quic_0rtt(cfg.enable_0rtt || cfg.zero_rtt.enabled())
+        .quic_0rtt_credential_profile(cfg.zero_rtt.credential_profile.as_str())
+        .quic_0rtt_auth_policy_epoch(cfg.zero_rtt.auth_policy_epoch)
+        .quic_0rtt_ticket_capacity(cfg.zero_rtt.ticket_capacity)
+        .quic_0rtt_ticket_ttl(cfg.zero_rtt.ticket_ttl)
+        .quic_0rtt_pre_finished_read_budget(
+            cfg.zero_rtt.pre_finished_read_budget.as_u32().min(cfg.max_packet_size.as_u32()),
+        )
+        .multistream_mode(cfg.multistream.mode.as_str())
+        .multistream_max_data_streams(cfg.multistream.max_data_streams())
+        .multistream_stream_open_rate(cfg.multistream.stream_open_rate)
+        .multistream_stream_idle_timeout(cfg.multistream.stream_idle_timeout)
+        .multistream_connection_mailbox_packets(cfg.multistream.connection_mailbox_packets)
+        .multistream_connection_buffer_bytes(cfg.multistream.connection_buffer_bytes.as_usize())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::config_builder;
+    use rmqtt_conf::listener::{ListenerInner, MultistreamMode, ZeroRttCredentialProfile, ZeroRttMode};
+
+    #[test]
+    fn config_builder_maps_multistream_listener_config() {
+        let mut cfg = ListenerInner::default();
+        cfg.multistream.mode = MultistreamMode::Simple;
+        cfg.multistream.max_data_streams = 4;
+        cfg.multistream.stream_open_rate = 16;
+        cfg.multistream.stream_idle_timeout = Duration::from_secs(30);
+        cfg.multistream.connection_mailbox_packets = 128;
+
+        let builder = config_builder(&cfg);
+
+        assert_eq!(builder.multistream_mode, "simple");
+        assert_eq!(builder.multistream_max_data_streams, 4);
+        assert_eq!(builder.multistream_stream_open_rate, 16);
+        assert_eq!(builder.multistream_stream_idle_timeout, Duration::from_secs(30));
+        assert_eq!(builder.multistream_connection_mailbox_packets, 128);
+        assert_eq!(builder.multistream_connection_buffer_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn config_builder_maps_zero_rtt_listener_policy() {
+        let mut cfg = ListenerInner::default();
+        cfg.enable_0rtt = true;
+        cfg.zero_rtt.mode = ZeroRttMode::HandshakeGated;
+        cfg.zero_rtt.credential_profile = ZeroRttCredentialProfile::ShortLivedToken;
+        cfg.zero_rtt.auth_policy_epoch = 5;
+        cfg.zero_rtt.ticket_capacity = 64;
+        cfg.zero_rtt.ticket_ttl = Duration::from_secs(45);
+
+        let builder = config_builder(&cfg);
+
+        assert!(builder.enable_quic_0rtt);
+        assert_eq!(builder.quic_0rtt_mode.as_str(), "handshake_gated");
+        assert_eq!(builder.quic_0rtt_credential_profile.as_str(), "short_lived_token");
+        assert_eq!(builder.quic_0rtt_auth_policy_epoch, 5);
+        assert_eq!(builder.quic_0rtt_ticket_capacity, 64);
+        assert_eq!(builder.quic_0rtt_ticket_ttl, Duration::from_secs(45));
+        assert_eq!(builder.quic_0rtt_pre_finished_read_budget, 64 * 1024);
+    }
 }
 
 fn config_args(cfg: &Settings) -> CommandArgs {

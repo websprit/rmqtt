@@ -383,6 +383,33 @@ impl InInflight {
     }
 
     #[inline]
+    pub(crate) fn contains(&self, pid: &NonZeroU16) -> bool {
+        self.cached.contains(pid)
+    }
+
+    #[inline]
+    pub(crate) fn snapshot(&self) -> Vec<NonZeroU16> {
+        self.cached.iter().copied().collect()
+    }
+
+    pub(crate) fn restore(&mut self, packet_ids: Vec<NonZeroU16>) {
+        let restored = packet_ids.into_iter().collect::<BTreeSet<_>>();
+
+        #[cfg(feature = "stats")]
+        {
+            let old_len = self.cached.len() as isize;
+            let new_len = restored.len() as isize;
+            match new_len.cmp(&old_len) {
+                std::cmp::Ordering::Greater => self.scx.stats.in_inflights.incs(new_len - old_len),
+                std::cmp::Ordering::Less => self.scx.stats.in_inflights.decs(old_len - new_len),
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+
+        self.cached = restored;
+    }
+
+    #[inline]
     pub(crate) fn add(&mut self, pid: NonZeroU16, qos: QoS) -> std::result::Result<bool, Reason> {
         if self.cached.len() >= self.max_inflight as usize {
             return Err(Reason::InflightWindowFull);

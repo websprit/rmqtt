@@ -76,7 +76,7 @@ pub type Result<T> = anyhow::Result<T, Error>;
 | `.proxy_protocol(v)` | `bool` | `false` |
 | `.proxy_protocol_timeout(d)` | `Duration` | `5s` |
 | `.idle_timeout(d)` | `Duration` | `90s` |
-| `.enable_quic_0rtt(v)` | `bool` | `false`；早期数据存在重放风险，且不能与双向 TLS 同时启用 |
+| `.enable_quic_0rtt(v)` | `bool` | `false`；启用 Finished 栅栏保护的 CONNECT 传输和单次消费有状态 ticket，且不能与双向 TLS 同时启用 |
 | `.bind(self) -> Result<Listener>` | — | 绑定 TCP socket |
 | `.bind_quic(self) -> Result<Listener>` | — | `#[cfg(feature = "quic")]` |
 
@@ -85,6 +85,7 @@ pub type Result<T> = anyhow::Result<T, Error>;
 ```rust
 listener.accept().await? -> Acceptor<S>
 listener.accept_quic().await? -> Acceptor<QuinnBiStream>  // #[cfg(feature = "quic")]
+listener.next_quic().await?.accept_control().await?.mqtt() // 推荐的验证后 typestate 路径
 listener.local_addr() -> Result<SocketAddr>
 ```
 
@@ -102,7 +103,7 @@ listener.wss()?  -> Listener  // #[cfg(feature = "tls")] #[cfg(feature = "ws")]
 acceptor.tcp() -> Result<Dispatcher<S>>            // 创建 TCP 分发器
 acceptor.tls() -> Result<Dispatcher<TlsStream<S>>> // #[cfg(feature = "tls")] TLS 握手
 acceptor.is_quic_0rtt() -> bool                     // #[cfg(feature = "quic")] 是否为早期数据流
-acceptor.take_quic_handshake_complete()             // 在产生 MQTT 会话副作用前等待完成
+// accept_quic() 只会在 QUIC/TLS Finished 栅栏验证成功后返回
 acceptor.remote_addr: SocketAddr                    // 客户端地址
 ```
 

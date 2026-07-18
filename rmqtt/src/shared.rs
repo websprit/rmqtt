@@ -479,9 +479,13 @@ impl Entry for LockEntry {
 
         if let Some(peer_tx) = self.tx().filter(|tx| !tx.is_closed()) {
             let (tx, rx) = oneshot::channel();
-            if let Ok(()) = peer_tx.unbounded_send(Message::Kick(tx, self.id.clone(), clean_start, is_admin))
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                peer_tx.send(Message::Kick(tx, self.id.clone(), clean_start, is_admin)),
+            )
+            .await
             {
-                match tokio::time::timeout(Duration::from_secs(5), rx).await {
+                Ok(Ok(())) => match tokio::time::timeout(Duration::from_secs(5), rx).await {
                     Ok(Ok(())) => {
                         log::debug!("{:?} kicked, from {:?}", self.id, self.session().map(|s| s.id.clone()));
                     }
@@ -500,7 +504,19 @@ impl Entry for LockEntry {
                             self.id,
                             self.session().map(|s| s.id.clone())
                         );
+                        return Err(anyhow!("timed out waiting for the previous session to stop"));
                     }
+                },
+                Ok(Err(e)) => {
+                    log::warn!("{:?} kick, send request error: {:?}", self.id, e);
+                }
+                Err(_) => {
+                    log::warn!(
+                        "{:?} kick, send request is Timeout, from {:?}",
+                        self.id,
+                        self.session().map(|s| s.id.clone())
+                    );
+                    return Err(anyhow!("timed out enqueueing the previous-session kick"));
                 }
             }
         }
@@ -599,10 +615,12 @@ impl Entry for LockEntry {
             log::warn!("{:?} forward, from:{:?}, error: Tx is None", self.id, from);
             return Err((from, p, Reason::from_static("Tx is None")));
         };
-        if let Err(e) = tx.unbounded_send(Message::Forward(from, p)) {
+        if let Err(e) = tx.try_send(Message::Forward(from, p)) {
             log::warn!("{:?} forward, error: {:?}", self.id, e);
+            let reason =
+                if e.is_full() { Reason::MessageQueueFull } else { Reason::from_static("Tx is closed") };
             if let Message::Forward(from, p) = e.into_inner() {
-                return Err((from, p, Reason::from_static("Tx is closed")));
+                return Err((from, p, reason));
             }
         }
         Ok(())
@@ -927,7 +945,7 @@ impl Shared for DefaultShared {
                 continue;
             };
 
-            if let Err(e) = tx.unbounded_send(Message::Forward(from.clone(), p)) {
+            if let Err(e) = tx.try_send(Message::Forward(from.clone(), p)) {
                 log::warn!(
                     "forwards_to failed, from:{:?}, to:{:?}, topic_filter:{:?}, topic:{:?}, reason:{:?}",
                     from,
@@ -936,8 +954,13 @@ impl Shared for DefaultShared {
                     publish.topic,
                     e
                 );
+                let reason = if e.is_full() {
+                    Reason::MessageQueueFull
+                } else {
+                    Reason::from_static("Connection Tx is closed")
+                };
                 if let Message::Forward(from, p) = e.into_inner() {
-                    errs.push((to, from, p, Reason::from_static("Connection Tx is closed")));
+                    errs.push((to, from, p, reason));
                 }
             } else {
                 // Collect successful session info with shared group expansion

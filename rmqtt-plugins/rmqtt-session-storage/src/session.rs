@@ -5,6 +5,7 @@
 //! session data (subscriptions, disconnect info, offline messages) to an
 //! external storage backend.
 
+use std::num::NonZeroU16;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -38,6 +39,7 @@ pub(crate) const DISCONNECT_INFO: &[u8] = b"2";
 pub(crate) const SESSION_SUB_MAP: &[u8] = b"3";
 pub(crate) const BASIC: &[u8] = b"4";
 pub(crate) const INFLIGHT_MESSAGES: &[u8] = b"5";
+pub(crate) const INBOUND_QOS2_AWAIT_PUBREL: &[u8] = b"6";
 
 #[derive(Clone)]
 pub(crate) struct StorageSessionManager {
@@ -759,6 +761,7 @@ pub(crate) struct StoredSessionInfo {
     pub disconnect_info: Option<DisconnectInfo>,
     pub offline_messages: Vec<(From, Publish)>,
     pub inflight_messages: Vec<OutInflightMessage>,
+    pub inbound_qos2_await_pubrel: Vec<NonZeroU16>,
     pub last_time: TimestampMillis,
 }
 
@@ -773,6 +776,7 @@ impl StoredSessionInfo {
             disconnect_info: None,
             offline_messages: Vec::new(),
             inflight_messages: Vec::new(),
+            inbound_qos2_await_pubrel: Vec::new(),
             last_time,
         }
     }
@@ -793,6 +797,26 @@ impl StoredSessionInfo {
         if self.last_time < last_time {
             self.last_time = last_time;
         }
+    }
+}
+
+#[cfg(test)]
+mod stored_session_info_tests {
+    use super::*;
+
+    #[test]
+    fn from_defaults_inbound_qos2_await_pubrel_to_empty() {
+        let id = Id::from(1, ClientId::from_static("stored-session-info-test"));
+        let basic = Basic {
+            conn_info: Arc::new(ConnectInfo::from(id.clone())),
+            id,
+            created_at: 10,
+            connected_at: 20,
+        };
+
+        let stored = StoredSessionInfo::from(Bytes::from_static(b"session"), basic);
+
+        assert!(stored.inbound_qos2_await_pubrel.is_empty());
     }
 }
 
