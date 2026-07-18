@@ -136,6 +136,7 @@ An ACK appearing on another flow cannot be accepted solely by Packet Identifier.
 The first version keeps the existing MQTT QUIC ALPN and makes multistream an opt-in profile on the listener:
 
 - MQTT 5 clients should request `rmqtt-quic-multistream=simple-v1` in CONNECT User Property. The Broker enables Data Flow only after it explicitly accepts this in CONNACK;
+- `multistream.negotiation="strict"` (the default) preserves that explicit negotiation; a dedicated compatibility listener may use `"preconfigured"` so legacy clients that cannot send the property still activate `simple-v1`, while the Broker continues to return `rmqtt-quic-multistream=simple-v1` in CONNACK;
 - MQTT 3.1.1 has no User Property and must use a dedicated listener/port or mutual preconfiguration;
 - Seeing extra QUIC stream credit is not equivalent to successful application-layer negotiation. The client must still wait for successful CONNACK;
 - Clients that did not negotiate or are unsupported always use Control Flow.
@@ -511,6 +512,7 @@ Recommended configuration shape:
 ```toml
 [listener.quic.external.multistream]
 mode = "simple"                 # disabled | simple
+negotiation = "strict"          # strict | preconfigured
 max_data_streams = 8
 stream_open_rate = 32            # per connection / second
 stream_idle_timeout = "60s"
@@ -519,6 +521,8 @@ connection_buffer_bytes = "1MB"
 topic_alias = "disabled"
 flow_failure_policy = "close-if-stateful"
 ```
+
+Use `preconfigured` only on a dedicated listener whose clients have been verified as wire-compatible, such as a legacy SDK that cannot put `rmqtt-quic-multistream=simple-v1` in MQTT 5 CONNECT. It is not auto-detection: the configuration is prior agreement to use `simple-v1`. The default remains `strict` so ordinary MQTT 5 clients are not unexpectedly switched to disabled Topic Alias and multiple Data Flow semantics.
 
 Also limit:
 

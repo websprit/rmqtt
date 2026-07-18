@@ -1,0 +1,29 @@
+# Android Demo `quic_features` evidence captured on 2026-07-19.
+# Device: Pixel 9 Pro XL / Android 17 / arm64-v8a.
+# Broker: RMQTT `simple_quic`, `simple` + `preconfigured`, running on device loopback.
+
+RUN 1
+clientId=rmqtt-loopback-e2e-0719
+07-19 04:35:05.563 I UGMqttDemo: QUIC_FEATURE_SUMMARY warmup=PASS attempted=PASS outcome=ACCEPTED streamA=4 streamB=8 subAckA=PASS subAckB=PASS pubAckA=PASS pubAckB=PASS postClose=PASS result=PASS
+
+RUN 2
+clientId=rmqtt-loopback-e2e-0719-r2
+07-19 04:35:45.046 I UGMqttDemo: QUIC_FEATURE_SUMMARY warmup=PASS attempted=PASS outcome=ACCEPTED streamA=4 streamB=8 subAckA=PASS subAckB=PASS pubAckA=PASS pubAckB=PASS postClose=PASS result=PASS
+
+RUN 3
+clientId=rmqtt-loopback-e2e-0719-r3
+07-19 04:35:46.299 I UGMqttDemo: quic zero-rtt cache post-connect insert=0 take=1 lastInsertMaxEarlyData=-1 lastTakeMaxEarlyData=-1 lastInsertQuicParamsLen=-1 lastTakeQuicParamsLen=-1 keysAvailable=0 earlyControlStreamOpened=0
+07-19 04:35:46.306 I UGMqttDemo: quic phase=quic_handshake_done phaseMs=7 totalMs=29
+07-19 04:35:46.308 I UGMqttDemo: quic phase=connack_received phaseMs=10 totalMs=31
+07-19 04:35:48.455 I UGMqttDemo: quic zero-rtt cache post-connect insert=2 take=2 lastInsertMaxEarlyData=4294967295 lastTakeMaxEarlyData=4294967295 lastInsertQuicParamsLen=123 lastTakeQuicParamsLen=123 keysAvailable=1 earlyControlStreamOpened=1
+07-19 04:35:48.456 I UGMqttDemo: quic phase=mqtt_connect_sent phaseMs=2 totalMs=23
+07-19 04:35:48.459 I UGMqttDemo: quic zero-rtt status=2
+07-19 04:35:48.462 I UGMqttDemo: quic zero-rtt status=3
+07-19 04:35:48.463 I UGMqttDemo: quic phase=connack_received phaseMs=8 totalMs=30
+07-19 04:35:48.468 I UGMqttDemo: QUIC_FEATURE open streamA rc=0 streamId=4 streamB rc=0 streamId=8
+07-19 04:35:48.672 I UGMqttDemo: callback rtc sub requestId=1000 code=0 streamId=4
+07-19 04:35:48.672 I UGMqttDemo: callback rtc sub requestId=1001 code=0 streamId=8
+07-19 04:35:48.876 I UGMqttDemo: callback rtc pub requestId=1002 code=0 streamId=4
+07-19 04:35:48.877 I UGMqttDemo: callback rtc pub requestId=1003 code=0 streamId=8
+07-19 04:35:49.086 I UGMqttDemo: callback rtc pub requestId=1004 code=0
+07-19 04:35:49.086 I UGMqttDemo: QUIC_FEATURE_SUMMARY warmup=PASS attempted=PASS outcome=ACCEPTED streamA=4 streamB=8 subAckA=PASS subAckB=PASS pubAckA=PASS pubAckB=PASS postClose=PASS result=PASS

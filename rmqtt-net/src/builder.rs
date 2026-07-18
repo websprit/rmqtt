@@ -263,6 +263,8 @@ pub struct Builder {
     pub quic_0rtt_pre_finished_read_budget: u32,
     /// QUIC multistream mode string, currently `disabled` or `simple`.
     pub multistream_mode: String,
+    /// MQTT 5 multistream negotiation policy, currently `strict` or `preconfigured`.
+    pub multistream_negotiation: String,
     /// Maximum concurrent MQTT data streams allowed after QUIC multistream activation.
     pub multistream_max_data_streams: u32,
     /// Maximum MQTT data-stream open rate allowed after QUIC multistream activation.
@@ -349,6 +351,7 @@ impl Builder {
             quic_0rtt_ticket_ttl: Duration::from_secs(10 * 60),
             quic_0rtt_pre_finished_read_budget: 64 * 1024,
             multistream_mode: "disabled".into(),
+            multistream_negotiation: "strict".into(),
             multistream_max_data_streams: 8,
             multistream_stream_open_rate: 32,
             multistream_stream_idle_timeout: Duration::from_secs(60),
@@ -655,6 +658,12 @@ impl Builder {
         self
     }
 
+    /// Configures MQTT 5 QUIC multistream negotiation policy.
+    pub fn multistream_negotiation<N: Into<String>>(mut self, negotiation: N) -> Self {
+        self.multistream_negotiation = negotiation.into();
+        self
+    }
+
     /// Configures maximum MQTT data streams per QUIC connection.
     pub fn multistream_max_data_streams(mut self, max_data_streams: u32) -> Self {
         self.multistream_max_data_streams = max_data_streams.min(u32::MAX - 1);
@@ -771,7 +780,13 @@ impl Builder {
                 tls_config.alpn_protocols.iter().map(Vec::as_slice),
                 u64::from(self.quic_0rtt_pre_finished_read_budget),
                 self.quic_0rtt_auth_policy_epoch,
-                format!("{}:{}", self.quic_0rtt_credential_profile.as_str(), self.multistream_mode).as_str(),
+                format!(
+                    "{}:{}:{}",
+                    self.quic_0rtt_credential_profile.as_str(),
+                    self.multistream_mode,
+                    self.multistream_negotiation
+                )
+                .as_str(),
             );
             tls_config.session_storage = ReplaySafeServerSessionStore::new(
                 self.quic_0rtt_ticket_capacity,
@@ -1442,6 +1457,7 @@ mod tests {
         let builder = Builder::new();
 
         assert_eq!(builder.multistream_mode, "disabled");
+        assert_eq!(builder.multistream_negotiation, "strict");
         assert_eq!(builder.multistream_max_data_streams, 8);
         assert_eq!(builder.multistream_stream_open_rate, 32);
         assert_eq!(builder.multistream_stream_idle_timeout, Duration::from_secs(60));
@@ -1450,6 +1466,7 @@ mod tests {
 
         let builder = Builder::new()
             .multistream_mode("simple")
+            .multistream_negotiation("preconfigured")
             .multistream_max_data_streams(u32::MAX)
             .multistream_stream_open_rate(16)
             .multistream_stream_idle_timeout(Duration::from_secs(30))
@@ -1457,6 +1474,7 @@ mod tests {
             .multistream_connection_buffer_bytes(512 * 1024);
 
         assert_eq!(builder.multistream_mode, "simple");
+        assert_eq!(builder.multistream_negotiation, "preconfigured");
         assert_eq!(builder.multistream_max_data_streams, u32::MAX - 1);
         assert_eq!(builder.multistream_stream_open_rate, 16);
         assert_eq!(builder.multistream_stream_idle_timeout, Duration::from_secs(30));

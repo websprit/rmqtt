@@ -186,9 +186,12 @@ where
         .recv_connect(sink.cfg.handshake_timeout)
         .await
         .map_err(|e| (ConnectAckReason::V5(ConnectAckReasonV5::ServerUnavailable), e))?;
-    let multistream_requested = requests_quic_multistream(&c);
-    let multistream_accepted =
-        allow_multistream && sink.cfg.multistream_mode == "simple" && multistream_requested;
+    let multistream_accepted = accepts_quic_multistream(
+        &c,
+        allow_multistream,
+        &sink.cfg.multistream_mode,
+        &sink.cfg.multistream_negotiation,
+    );
 
     log::debug!(
         "new Connection: local_addr: {:?}, remote_addr: {:?}, listen_cfg: {:?}",
@@ -498,6 +501,17 @@ fn requests_quic_multistream(connect: &ConnectV5) -> bool {
     })
 }
 
+fn accepts_quic_multistream(
+    connect: &ConnectV5,
+    allow_multistream: bool,
+    mode: &str,
+    negotiation: &str,
+) -> bool {
+    allow_multistream
+        && mode == "simple"
+        && (negotiation == "preconfigured" || requests_quic_multistream(connect))
+}
+
 async fn refused_ack<Io>(
     scx: &ServerContext,
     sink: &mut v5::MqttStream<Io>,
@@ -542,5 +556,41 @@ mod tests {
 
         connect.user_properties.push((QUIC_MULTISTREAM_PROPERTY.into(), QUIC_MULTISTREAM_SIMPLE_V1.into()));
         assert!(requests_quic_multistream(&connect));
+    }
+
+    #[test]
+    fn strict_multistream_negotiation_rejects_client_without_property() {
+        let connect = ConnectV5::default();
+
+        assert!(!accepts_quic_multistream(&connect, true, "simple", "strict"));
+    }
+
+    #[test]
+    fn strict_multistream_negotiation_accepts_exact_property() {
+        let mut connect = ConnectV5::default();
+        connect.user_properties.push((QUIC_MULTISTREAM_PROPERTY.into(), QUIC_MULTISTREAM_SIMPLE_V1.into()));
+
+        assert!(accepts_quic_multistream(&connect, true, "simple", "strict"));
+    }
+
+    #[test]
+    fn preconfigured_multistream_negotiation_accepts_client_without_property() {
+        let connect = ConnectV5::default();
+
+        assert!(accepts_quic_multistream(&connect, true, "simple", "preconfigured"));
+    }
+
+    #[test]
+    fn disabled_multistream_never_accepts_preconfigured_client() {
+        let connect = ConnectV5::default();
+
+        assert!(!accepts_quic_multistream(&connect, true, "disabled", "preconfigured"));
+    }
+
+    #[test]
+    fn non_quic_connection_never_accepts_preconfigured_multistream() {
+        let connect = ConnectV5::default();
+
+        assert!(!accepts_quic_multistream(&connect, false, "simple", "preconfigured"));
     }
 }

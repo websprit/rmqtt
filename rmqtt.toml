@@ -339,9 +339,11 @@ listener.quic.external.zero_rtt.ticket_capacity = 4096
 listener.quic.external.zero_rtt.ticket_ttl = "10m"
 listener.quic.external.zero_rtt.pre_finished_read_budget = "64KB"
 
-#Optional RMQTT Simple Multistream profile. MQTT 5 clients request simple-v1 in CONNECT;
-#MQTT 3.1.1 requires this dedicated listener to be preconfigured on both sides.
+#Optional RMQTT Simple Multistream profile. MQTT 5 clients normally request simple-v1 in CONNECT.
+#Set negotiation="preconfigured" only on a dedicated listener for legacy clients that cannot send
+#the rmqtt-quic-multistream=simple-v1 CONNECT User Property. MQTT 3.1.1 is always preconfigured.
 listener.quic.external.multistream.mode = "disabled"
+listener.quic.external.multistream.negotiation = "strict"
 listener.quic.external.multistream.max_data_streams = 8
 listener.quic.external.multistream.stream_open_rate = 32
 listener.quic.external.multistream.stream_idle_timeout = "60s"

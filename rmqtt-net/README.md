@@ -84,6 +84,7 @@ All fields have `pub` visibility and fluent setter methods:
 | `.quic_0rtt_ticket_ttl(d)` | `Duration` | `600s`; ticket cache lifetime |
 | `.quic_0rtt_pre_finished_read_budget(n)` | `u32` | `64 KiB`; transport receive budget before TLS Finished |
 | `.multistream_mode(s)` | `impl Into<String>` | `disabled` or `simple`; enables post-CONNACK data flows |
+| `.multistream_negotiation(s)` | `impl Into<String>` | `strict` or `preconfigured`; the latter accepts MQTT 5 clients without the `rmqtt-quic-multistream=simple-v1` CONNECT property |
 | `.multistream_max_data_streams(n)` | `u32` | `8`; maximum extra MQTT data flows per connection |
 | `.multistream_stream_open_rate(n)` | `u32` | `32`; data-flow opens allowed per connection window |
 | `.multistream_stream_idle_timeout(d)` | `Duration` | `60s`; idle timeout for a data flow |

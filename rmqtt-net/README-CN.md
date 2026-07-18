@@ -84,6 +84,7 @@ pub type Result<T> = anyhow::Result<T, Error>;
 | `.quic_0rtt_ticket_ttl(d)` | `Duration` | `600s`；ticket 缓存有效期 |
 | `.quic_0rtt_pre_finished_read_budget(n)` | `u32` | `64 KiB`；TLS Finished 前的传输层接收预算 |
 | `.multistream_mode(s)` | `impl Into<String>` | `disabled` 或 `simple`；启用 CONNACK 后的数据 Flow |
+| `.multistream_negotiation(s)` | `impl Into<String>` | `strict` 或 `preconfigured`；后者兼容未发送 `rmqtt-quic-multistream=simple-v1` CONNECT 属性的 MQTT 5 客户端 |
 | `.multistream_max_data_streams(n)` | `u32` | `8`；每连接额外 MQTT 数据 Flow 的最大数 |
 | `.multistream_stream_open_rate(n)` | `u32` | `32`；每个连接窗口允许打开的数据 Flow 数 |
 | `.multistream_stream_idle_timeout(d)` | `Duration` | `60s`；数据 Flow 空闲超时 |

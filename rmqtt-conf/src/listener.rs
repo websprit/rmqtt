@@ -195,12 +195,26 @@ pub enum MultistreamMode {
     Simple,
 }
 
+/// MQTT 5 multistream negotiation policy for QUIC listeners.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MultistreamNegotiation {
+    /// Require the exact `rmqtt-quic-multistream=simple-v1` CONNECT User Property.
+    #[default]
+    Strict,
+    /// Treat the listener configuration as prior agreement with legacy clients.
+    Preconfigured,
+}
+
 /// QUIC multistream listener configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Multistream {
     /// Negotiated multistream mode for this QUIC listener.
     #[serde(default)]
     pub mode: MultistreamMode,
+    /// MQTT 5 client opt-in policy for this QUIC listener.
+    #[serde(default)]
+    pub negotiation: MultistreamNegotiation,
     /// Maximum number of concurrent MQTT data streams after multistream activation.
     #[serde(default = "Multistream::max_data_streams_default")]
     pub max_data_streams: u32,
@@ -222,6 +236,7 @@ impl Default for Multistream {
     fn default() -> Self {
         Self {
             mode: MultistreamMode::Disabled,
+            negotiation: MultistreamNegotiation::Strict,
             max_data_streams: Self::max_data_streams_default(),
             stream_open_rate: Self::stream_open_rate_default(),
             stream_idle_timeout: Self::stream_idle_timeout_default(),
@@ -277,6 +292,17 @@ impl MultistreamMode {
         match self {
             Self::Disabled => "disabled",
             Self::Simple => "simple",
+        }
+    }
+}
+
+impl MultistreamNegotiation {
+    #[inline]
+    /// Returns the TOML/string representation for this negotiation policy.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Preconfigured => "preconfigured",
         }
     }
 }
@@ -813,6 +839,7 @@ mod tests {
         let multistream = ListenerInner::default().multistream;
 
         assert_eq!(multistream.mode, super::MultistreamMode::Disabled);
+        assert_eq!(multistream.negotiation, super::MultistreamNegotiation::Strict);
         assert_eq!(multistream.max_data_streams, 8);
         assert_eq!(multistream.stream_open_rate, 32);
         assert_eq!(multistream.stream_idle_timeout, Duration::from_secs(60));
@@ -826,6 +853,7 @@ mod tests {
             "addr": "127.0.0.1:9443",
             "multistream": {
                 "mode": "simple",
+                "negotiation": "preconfigured",
                 "max_data_streams": 4,
                 "stream_open_rate": 16,
                 "stream_idle_timeout": "30s",
@@ -836,6 +864,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(listener.multistream.mode, super::MultistreamMode::Simple);
+        assert_eq!(listener.multistream.negotiation, super::MultistreamNegotiation::Preconfigured);
         assert_eq!(listener.multistream.max_data_streams, 4);
         assert_eq!(listener.multistream.stream_open_rate, 16);
         assert_eq!(listener.multistream.stream_idle_timeout, Duration::from_secs(30));

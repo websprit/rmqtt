@@ -258,6 +258,7 @@ fn config_builder(cfg: &ListenerInner) -> Builder {
             cfg.zero_rtt.pre_finished_read_budget.as_u32().min(cfg.max_packet_size.as_u32()),
         )
         .multistream_mode(cfg.multistream.mode.as_str())
+        .multistream_negotiation(cfg.multistream.negotiation.as_str())
         .multistream_max_data_streams(cfg.multistream.max_data_streams())
         .multistream_stream_open_rate(cfg.multistream.stream_open_rate)
         .multistream_stream_idle_timeout(cfg.multistream.stream_idle_timeout)
@@ -280,12 +281,15 @@ mod tests {
     use std::time::Duration;
 
     use super::config_builder;
-    use rmqtt_conf::listener::{ListenerInner, MultistreamMode, ZeroRttCredentialProfile, ZeroRttMode};
+    use rmqtt_conf::listener::{
+        ListenerInner, MultistreamMode, MultistreamNegotiation, ZeroRttCredentialProfile, ZeroRttMode,
+    };
 
     #[test]
     fn config_builder_maps_multistream_listener_config() {
         let mut cfg = ListenerInner::default();
         cfg.multistream.mode = MultistreamMode::Simple;
+        cfg.multistream.negotiation = MultistreamNegotiation::Preconfigured;
         cfg.multistream.max_data_streams = 4;
         cfg.multistream.stream_open_rate = 16;
         cfg.multistream.stream_idle_timeout = Duration::from_secs(30);
@@ -294,6 +298,7 @@ mod tests {
         let builder = config_builder(&cfg);
 
         assert_eq!(builder.multistream_mode, "simple");
+        assert_eq!(builder.multistream_negotiation, "preconfigured");
         assert_eq!(builder.multistream_max_data_streams, 4);
         assert_eq!(builder.multistream_stream_open_rate, 16);
         assert_eq!(builder.multistream_stream_idle_timeout, Duration::from_secs(30));

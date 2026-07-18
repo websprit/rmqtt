@@ -4,6 +4,7 @@
 适用范围：RMQTT `support-0RTT` 分支，MQTT 3.1.1 / MQTT 5.0 over QUIC
 研究依据：[mqtt-quic-multistream-research.md](./mqtt-quic-multistream-research.md)
 安全前置：[mqtt-quic-0rtt-replay-protection.md](./mqtt-quic-0rtt-replay-protection.md)
+Android SDK 联调记录：[android-sdk-quic-0rtt-e2e.md](../development/android-sdk-quic-0rtt-e2e.md)
 
 ## 1. 决策摘要
 
@@ -136,6 +137,7 @@ ACK 出现在其他 flow 时，不能只按 Packet Identifier 接受。它属于
 第一版保持现有 MQTT QUIC ALPN，并把多流作为 listener 上的 opt-in profile：
 
 - MQTT 5 客户端应在 CONNECT User Property 请求 `rmqtt-quic-multistream=simple-v1`；Broker 只在 CONNACK 中明确接受后启用 Data Flow；
+- `multistream.negotiation="strict"`（默认）保持上述显式协商；专用兼容 listener 可设置 `"preconfigured"`，使无法发送该属性的旧客户端也按 `simple-v1` 激活，Broker 仍在 CONNACK 返回 `rmqtt-quic-multistream=simple-v1`；
 - MQTT 3.1.1 没有 User Property，必须使用专用 listener/端口或双方预配置；
 - 只看到额外 QUIC stream credit 不等价于应用层协商成功；客户端仍必须等成功 CONNACK；
 - 未协商或不支持的客户端始终使用 Control Flow。
@@ -511,6 +513,7 @@ MQTT 5 尽可能在 Control Flow 发送合适的 DISCONNECT reason 后关闭；M
 ```toml
 [listener.quic.external.multistream]
 mode = "simple"                 # disabled | simple
+negotiation = "strict"          # strict | preconfigured
 max_data_streams = 8
 stream_open_rate = 32            # per connection / second
 stream_idle_timeout = "60s"
@@ -519,6 +522,8 @@ connection_buffer_bytes = "1MB"
 topic_alias = "disabled"
 flow_failure_policy = "close-if-stateful"
 ```
+
+`preconfigured` 只应用于已确认线协议兼容的专用 listener，例如当前无法在 MQTT 5 CONNECT 中携带 `rmqtt-quic-multistream=simple-v1` 的旧 SDK。它不是自动探测：配置即代表双方已预先同意 `simple-v1`。默认 `strict` 不变，避免普通 MQTT 5 客户端被意外切换到 Topic Alias 禁用和多 Data Flow 语义。
 
 必须同时限制：
 
