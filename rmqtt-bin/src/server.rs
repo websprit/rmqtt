@@ -265,6 +265,16 @@ fn config_builder(cfg: &ListenerInner) -> Builder {
         .multistream_connection_buffer_bytes(cfg.multistream.connection_buffer_bytes.as_usize())
 }
 
+fn config_args(cfg: &Settings) -> CommandArgs {
+    CommandArgs {
+        node_id: cfg.opts.node_id,
+        plugins_default_startups: cfg.opts.plugins_default_startups.clone(),
+        node_grpc_addrs: cfg.opts.node_grpc_addrs.clone(),
+        raft_peer_addrs: cfg.opts.raft_peer_addrs.clone(),
+        raft_leader_id: cfg.opts.raft_leader_id,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -293,8 +303,7 @@ mod tests {
 
     #[test]
     fn config_builder_maps_zero_rtt_listener_policy() {
-        let mut cfg = ListenerInner::default();
-        cfg.enable_0rtt = true;
+        let mut cfg = ListenerInner { enable_0rtt: true, ..Default::default() };
         cfg.zero_rtt.mode = ZeroRttMode::HandshakeGated;
         cfg.zero_rtt.credential_profile = ZeroRttCredentialProfile::ShortLivedToken;
         cfg.zero_rtt.auth_policy_epoch = 5;
@@ -310,15 +319,5 @@ mod tests {
         assert_eq!(builder.quic_0rtt_ticket_capacity, 64);
         assert_eq!(builder.quic_0rtt_ticket_ttl, Duration::from_secs(45));
         assert_eq!(builder.quic_0rtt_pre_finished_read_budget, 64 * 1024);
-    }
-}
-
-fn config_args(cfg: &Settings) -> CommandArgs {
-    CommandArgs {
-        node_id: cfg.opts.node_id,
-        plugins_default_startups: cfg.opts.plugins_default_startups.clone(),
-        node_grpc_addrs: cfg.opts.node_grpc_addrs.clone(),
-        raft_peer_addrs: cfg.opts.raft_peer_addrs.clone(),
-        raft_leader_id: cfg.opts.raft_leader_id,
     }
 }

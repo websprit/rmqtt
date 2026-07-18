@@ -35,6 +35,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(feature = "quic")]
+use std::collections::HashMap;
+#[cfg(feature = "quic")]
+use std::net::{IpAddr, Ipv6Addr};
+#[cfg(feature = "quic")]
+use std::sync::Mutex;
+#[cfg(feature = "quic")]
+use std::time::Instant;
+
+#[cfg(feature = "quic")]
 use crate::quic::{QuicIncoming, QuinnBiStream};
 #[cfg(feature = "quic")]
 use crate::quic_session_store::{ReplaySafeServerSessionStore, ZeroRttProfileFingerprint};
@@ -706,6 +715,8 @@ impl Builder {
         );
         #[cfg(feature = "quic")]
         let quic_handshake_permits = Arc::new(Semaphore::new(self.max_handshaking_limit.max(1)));
+        #[cfg(feature = "quic")]
+        let quic_prefix_limiter = Arc::new(QuicPrefixLimiter::new(self.max_handshaking_limit.max(1)));
         Ok(Listener {
             typ: ListenerType::TCP,
             cfg: Arc::new(self),
@@ -716,6 +727,8 @@ impl Builder {
             quinn_endpoint: None,
             #[cfg(feature = "quic")]
             quic_handshake_permits,
+            #[cfg(feature = "quic")]
+            quic_prefix_limiter,
         })
     }
 
@@ -784,6 +797,7 @@ impl Builder {
 
         let endpoint = quinn::Endpoint::server(server_config, self.laddr)?;
         let quic_handshake_permits = Arc::new(Semaphore::new(self.max_handshaking_limit.max(1)));
+        let quic_prefix_limiter = Arc::new(QuicPrefixLimiter::new(self.max_handshaking_limit.max(1)));
 
         log::info!("MQTT Broker Listening on {} {}", self.name, endpoint.local_addr().unwrap_or(self.laddr));
         Ok(Listener {
@@ -794,6 +808,7 @@ impl Builder {
             tls_acceptor: None,
             quinn_endpoint: Some(endpoint),
             quic_handshake_permits,
+            quic_prefix_limiter,
         })
     }
 
@@ -865,6 +880,91 @@ pub struct Listener {
     quinn_endpoint: Option<quinn::Endpoint>,
     #[cfg(feature = "quic")]
     quic_handshake_permits: Arc<Semaphore>,
+    #[cfg(feature = "quic")]
+    quic_prefix_limiter: Arc<QuicPrefixLimiter>,
+}
+
+#[cfg(feature = "quic")]
+const QUIC_PREFIX_WINDOW: Duration = Duration::from_secs(1);
+
+#[cfg(feature = "quic")]
+#[derive(Debug)]
+struct QuicAdmissionRejected(&'static str);
+
+#[cfg(feature = "quic")]
+impl std::fmt::Display for QuicAdmissionRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "QUIC admission rejected: {}", self.0)
+    }
+}
+
+#[cfg(feature = "quic")]
+impl std::error::Error for QuicAdmissionRejected {}
+
+#[cfg(feature = "quic")]
+/// Returns whether an error represents a connection already handled by QUIC admission control.
+///
+/// Such errors are non-fatal for the listener loop: the peer has already received a Retry or
+/// refusal, so accepting the next datagram must continue without listener-level backoff.
+pub fn is_quic_admission_rejection(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<QuicAdmissionRejected>().is_some()
+}
+
+#[cfg(feature = "quic")]
+struct QuicPrefixLimiter {
+    entries: Mutex<HashMap<IpAddr, (Instant, usize)>>,
+    max_entries: usize,
+    per_prefix_limit: usize,
+}
+
+#[cfg(feature = "quic")]
+impl QuicPrefixLimiter {
+    fn new(max_handshakes: usize) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            max_entries: max_handshakes.saturating_mul(4).max(16),
+            per_prefix_limit: (max_handshakes / 4).max(1),
+        }
+    }
+
+    fn allow(&self, remote_addr: SocketAddr) -> bool {
+        let now = Instant::now();
+        let prefix = quic_remote_prefix(remote_addr.ip());
+        let Ok(mut entries) = self.entries.lock() else {
+            return false;
+        };
+        entries.retain(|_, (started, _)| now.duration_since(*started) < QUIC_PREFIX_WINDOW);
+        if !entries.contains_key(&prefix) && entries.len() >= self.max_entries {
+            return false;
+        }
+        let entry = entries.entry(prefix).or_insert((now, 0));
+        if now.duration_since(entry.0) >= QUIC_PREFIX_WINDOW {
+            *entry = (now, 0);
+        }
+        if entry.1 >= self.per_prefix_limit {
+            return false;
+        }
+        entry.1 += 1;
+        true
+    }
+}
+
+#[cfg(feature = "quic")]
+fn quic_remote_prefix(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(ip) => IpAddr::V4(Ipv4Addr::from(u32::from(ip) & 0xffff_ff00)),
+        IpAddr::V6(ip) => IpAddr::V6(Ipv6Addr::from(u128::from(ip) & (!0_u128 << 72))),
+    }
+}
+
+#[cfg(feature = "quic")]
+fn reject_or_retry_quic(incoming: quinn::Incoming, reason: &'static str) -> Result<QuicIncoming> {
+    if incoming.may_retry() {
+        incoming.retry().map_err(|_| anyhow!("QUIC {reason}: Retry failed"))?;
+        return Err(anyhow!(QuicAdmissionRejected(reason)));
+    }
+    incoming.refuse();
+    Err(anyhow!(QuicAdmissionRejected(reason)))
 }
 
 /// # Examples
@@ -1000,14 +1100,29 @@ impl Listener {
     pub async fn next_quic(&self) -> Result<QuicIncoming> {
         let endpoint =
             self.quinn_endpoint.as_ref().ok_or_else(|| anyhow!("No active QUIC endpoint available"))?;
-        let permit = self
-            .quic_handshake_permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| anyhow!("QUIC handshake admission is closed"))?;
+        let zero_rtt_enabled =
+            self.cfg.enable_quic_0rtt || self.cfg.quic_0rtt_mode == ZeroRttMode::HandshakeGated;
+        if !zero_rtt_enabled {
+            let permit = self
+                .quic_handshake_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow!("QUIC handshake admission is closed"))?;
+            let incoming =
+                endpoint.accept().await.ok_or_else(|| anyhow!("No incoming QUIC connection available"))?;
+            return QuicIncoming::new(incoming, self.cfg.clone(), permit);
+        }
+
         let incoming =
             endpoint.accept().await.ok_or_else(|| anyhow!("No incoming QUIC connection available"))?;
+        if !self.quic_prefix_limiter.allow(incoming.remote_address()) {
+            return reject_or_retry_quic(incoming, "per-prefix handshake rate limit");
+        }
+        let permit = match self.quic_handshake_permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return reject_or_retry_quic(incoming, "handshake admission limit"),
+        };
         QuicIncoming::new(incoming, self.cfg.clone(), permit)
     }
 

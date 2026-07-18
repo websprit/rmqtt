@@ -71,7 +71,7 @@ The current implementation has landed the P0 safety boundary of this design:
 
 - `rmqtt-net` uses a stateful TLS session store with atomic `take`, and disables stateless tickets;
 - The endpoint initially grants only one client-initiated bidi Control Flow; uni-stream credit is 0;
-- `Listener::next_quic()` first acquires a shared handshake permit and returns only a lightweight `QuicIncoming`;
+- `Listener::next_quic()` uses bounded handshake admission; 0-RTT admission applies per-prefix rate limiting and sends QUIC Retry/refusal without backing off the whole listener;
 - `QuicIncoming::accept_control()` uses one deadline for QUIC connection establishment, first Control Flow receive, and the TLS Finished gate;
 - Before Finished, MQTT codec/version probing is not called, so application-layer bytes read is 0. The transport receive window still uses `pre_finished_read_budget` to limit Quinn early buffering;
 - `handshake_data()` must exist and `close_reason()` must be empty before `AcceptedQuicControl` is returned;
@@ -87,7 +87,7 @@ Implementation and code review must always verify these invariants:
 1. **Finished gate**: only successfully verified QUIC/TLS connections may enter MQTT v3/v5 handlers.
 2. **No pre-Finished side effect**: before Finished, do not call hooks, auth, shared/session, Will, CONNACK, or plugin interfaces.
 3. **No 0.5-RTT application response**: keep rustls `send_half_rtt_data = false`; the application layer does not write responses before Finished.
-4. **Control-only early stream**: before Finished and CONNACK send + flush commit, each MQTT/QUIC connection allows only one server-accepted client-initiated bidirectional Control Flow. Its early data can only be the first CONNECT. After multistream negotiation succeeds, commit may dynamically raise bidi stream credit to `1 + max_data_streams`; unnegotiated connections always stay at 1. Uni streams are always 0 in the first version.
+4. **Single early Control Flow**: before Finished and CONNACK send + flush commit, each MQTT/QUIC connection allows only one server-accepted client-initiated bidirectional Control Flow. Quinn marks a stream as early-opened but does not expose a byte-level boundary between replayable early bytes and later 1-RTT bytes on that stream; therefore “CONNECT only” is a mandatory client interoperability rule, not a broker-enforceable packet-origin test. The broker enforces the security boundary with Finished gating, a stateful single-use ticket, and no pre-Finished application side effect. After multistream negotiation succeeds, commit may dynamically raise bidi stream credit to `1 + max_data_streams`; unnegotiated connections always stay at 1. Uni streams are always 0 in the first version.
 5. **Stateful single-use ticket**: TLS 1.3 tickets usable for 0-RTT must be consumed by a stateful store with atomic `take`; stateless tickets are forbidden from entering the 0-RTT path.
 6. **Safe fallback**: ticket miss, replay, expiry, capacity eviction, process restart, or wrong-node routing only causes 0-RTT failure and 1-RTT retransmission.
 7. **Bounded pre-auth work**: before Finished, connection count, bytes read, buffering, parsing work, and wait time all have limits.
@@ -287,6 +287,8 @@ Ticket identity is consumed by the TLS layer, which is the correct security and 
 - If reads or writes on the early stream return `ZeroRttRejected` first, enter the same fallback state. That error and `accepted == false` may trigger only one once-only retransmission;
 - Do not wait indefinitely for an early CONNACK before deciding whether 0-RTT was accepted, or early-data rejection can deadlock the client.
 - Do not create Data Flow before CONNACK send + flush commit. Dynamic `MAX_STREAMS` received on the previous connection cannot be used for 0-RTT on the next connection.
+
+Quinn exposes only whether an entire stream was opened during 0-RTT, not which bytes were delivered as early data. A broker must therefore never claim to prove that bytes after CONNECT were sent after Finished. The client rule above, stateful single-use ticket consumption, and the Finished side-effect gate are the enforceable replay boundary for the interoperable MQTT control stream.
 
 Recommended client state uses one state machine to guarantee idempotent retransmission:
 

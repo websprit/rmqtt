@@ -57,18 +57,8 @@ async fn main() -> Result<()> {
     let connecting = endpoint.connect(server_addr, "localhost")?;
     let (connection, mut framed) = match connecting.into_0rtt() {
         Ok((connection, accepted)) => {
-            let mut framed = send_connect(&connection, "cid-0rtt").await?;
-            if accepted.await {
-                log::info!("Server accepted MQTT CONNECT as QUIC 0-RTT data");
-                recv_connack(&mut framed).await?;
-                (connection, framed)
-            } else {
-                log::warn!("Server rejected QUIC 0-RTT; retransmitting CONNECT after the handshake");
-                drop(framed);
-                let mut framed = send_connect(&connection, "cid-0rtt").await?;
-                recv_connack(&mut framed).await?;
-                (connection, framed)
-            }
+            let framed = complete_early_connect(&connection, accepted, "cid-0rtt").await?;
+            (connection, framed)
         }
         Err(connecting) => {
             log::warn!("No reusable 0-RTT ticket; falling back to a normal QUIC handshake");
@@ -86,6 +76,42 @@ async fn main() -> Result<()> {
     endpoint.wait_idle().await;
 
     Ok(())
+}
+
+async fn complete_early_connect(
+    connection: &quinn::Connection,
+    accepted: quinn::ZeroRttAccepted,
+    client_id: &str,
+) -> Result<MqttQuicStream> {
+    let early_connect = send_connect(connection, client_id).await;
+    let early_accepted = accepted.await;
+    match early_connect {
+        Ok(mut framed) if early_accepted => match recv_connack(&mut framed).await {
+            Ok(()) => {
+                log::info!("Server accepted MQTT CONNECT as QUIC 0-RTT data");
+                Ok(framed)
+            }
+            Err(error) if is_zero_rtt_rejected(&error) => fallback_connect(connection, client_id).await,
+            Err(error) => Err(error),
+        },
+        Ok(_) => fallback_connect(connection, client_id).await,
+        Err(error) if is_zero_rtt_rejected(&error) => fallback_connect(connection, client_id).await,
+        Err(error) => Err(error),
+    }
+}
+
+async fn fallback_connect(connection: &quinn::Connection, client_id: &str) -> Result<MqttQuicStream> {
+    log::warn!("Server rejected QUIC 0-RTT; retransmitting CONNECT once after the handshake");
+    let mut framed = send_connect(connection, client_id).await?;
+    recv_connack(&mut framed).await?;
+    Ok(framed)
+}
+
+fn is_zero_rtt_rejected(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(cause.downcast_ref::<quinn::ReadError>(), Some(quinn::ReadError::ZeroRttRejected))
+            || matches!(cause.downcast_ref::<quinn::WriteError>(), Some(quinn::WriteError::ZeroRttRejected))
+    })
 }
 
 async fn send_connect(connection: &quinn::Connection, client_id: &str) -> Result<MqttQuicStream> {

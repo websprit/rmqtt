@@ -130,6 +130,7 @@ pub(crate) async fn process_quic(
     scx: ServerContext,
     mut sink: v5::MqttStream<QuinnBiStream>,
     activation: QuicActivation,
+    is_0rtt: bool,
     lid: ListenerId,
 ) -> Result<()> {
     let (state, ack, keep_alive, multistream_accepted) = {
@@ -149,6 +150,13 @@ pub(crate) async fn process_quic(
             }
         }
     };
+
+    // Quinn only identifies an early-opened stream, not a byte-level 0-RTT boundary.
+    // This catches CONNECT plus a pipelined packet already decoded into Framed's buffer;
+    // Finished gating and single-use tickets remain the replay-security boundary.
+    if is_0rtt && sink.has_buffered_input() {
+        return Err(anyhow!("0-RTT control flow contains MQTT data after CONNECT"));
+    }
 
     let max_data_streams = if multistream_accepted { sink.cfg.multistream_max_data_streams } else { 0 };
     let committed = activation.send_v5_connack_and_commit(&mut sink, ack).await?;

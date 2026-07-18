@@ -71,7 +71,7 @@ RMQTT 第一版只提供一种安全的 0-RTT profile：**handshake-gated CONNEC
 
 - `rmqtt-net` 使用有状态、原子 `take` 的 TLS session store，并禁用 stateless ticket；
 - endpoint 初始只授予 1 条 client-initiated bidi Control Flow，uni stream credit 为 0；
-- `Listener::next_quic()` 先占用共享握手许可，只返回轻量 `QuicIncoming`；
+- `Listener::next_quic()` 使用有界握手准入；0-RTT 准入按前缀限速，并在不拖慢整个 listener 的情况下发送 QUIC Retry/refuse；
 - `QuicIncoming::accept_control()` 使用同一个截止时间完成 QUIC 建连、首条 Control Flow 接收和 TLS Finished 栅栏；
 - Finished 前不调用 MQTT codec/version probe，因此应用层读取字节数为 0；transport receive window 仍按 `pre_finished_read_budget` 限制 Quinn 的早期缓冲；
 - `handshake_data()` 必须存在且 `close_reason()` 必须为空，才会返回 `AcceptedQuicControl`；
@@ -87,7 +87,7 @@ RMQTT 第一版只提供一种安全的 0-RTT profile：**handshake-gated CONNEC
 1. **Finished gate**：只有已验证成功的 QUIC/TLS 连接能进入 MQTT v3/v5 处理器。
 2. **No pre-Finished side effect**：Finished 前不调用 hook、auth、shared/session、Will、CONNACK 或插件接口。
 3. **No 0.5-RTT application response**：保持 rustls `send_half_rtt_data = false`，应用层在 Finished 前不写响应。
-4. **Control-only early stream**：Finished 与 CONNACK send + flush commit 之前，每个 MQTT/QUIC 连接只允许一条被服务端接受的 client-initiated bidirectional Control Flow；其 early 数据只能是第一个 CONNECT。多流协商成功时，commit 后才可把 bidi stream credit 动态提高到 `1 + max_data_streams`；未协商连接始终保持 1。单向 stream 第一版始终为 0。
+4. **单条 early Control Flow**：Finished 与 CONNACK send + flush commit 之前，每个 MQTT/QUIC 连接只允许一条被服务端接受的 client-initiated bidirectional Control Flow。Quinn 只标记 stream 是否在 early 阶段打开，不提供同一 stream 内 replayable early 字节与后续 1-RTT 字节的逐字节边界；因此“只发送 CONNECT”是强制的客户端互操作约束，而不是 Broker 可验证的数据来源判断。Broker 通过 Finished 栅栏、有状态单次消费 ticket 和 Finished 前零应用副作用落实安全边界。多流协商成功时，commit 后才可把 bidi stream credit 动态提高到 `1 + max_data_streams`；未协商连接始终保持 1。单向 stream 第一版始终为 0。
 5. **Stateful single-use ticket**：可用于 0-RTT 的 TLS 1.3 ticket 必须由原子 `take` 的有状态存储消费，禁止 stateless ticket 进入 0-RTT 路径。
 6. **Safe fallback**：ticket miss、重放、过期、容量淘汰、进程重启或错误节点都只导致 0-RTT 失败和 1-RTT 重发。
 7. **Bounded pre-auth work**：Finished 前的连接数、读取字节、缓冲、解析工作和等待时间都有上限。
@@ -287,6 +287,8 @@ ticket 身份由 TLS 层消费，正好位于正确的安全和 locality 边界�
 - 若 early stream 的读写先返回 `ZeroRttRejected`，也进入同一个 fallback 状态；该错误与 `accepted == false` 只能触发同一份 once-only 重发；
 - 不得先无限等待早期 CONNACK 再判断 0-RTT 是否被接受，否则在 early data rejected 时可能形成客户端死锁。
 - CONNACK send + flush commit 前不得创建 Data Flow；上一连接收到的动态 `MAX_STREAMS` 不能用于下一连接的 0-RTT。
+
+Quinn 只能暴露整条 stream 是否在 0-RTT 阶段打开，不能暴露 CONNECT 后的某些字节是否仍属于 early data。Broker 因此不得声称能证明 CONNECT 后的字节发送于 Finished 之后；上面的客户端约束、有状态单次消费 ticket 和 Finished 副作用栅栏共同构成兼容 MQTT Control Flow 时可执行的 replay 防护边界。
 
 客户端状态建议使用单一状态机保证重发幂等：
 

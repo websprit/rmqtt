@@ -308,6 +308,12 @@ pub mod v3 {
             };
             Ok(connect)
         }
+
+        /// Returns whether bytes remain buffered after decoding CONNECT.
+        #[inline]
+        pub fn has_buffered_input(&self) -> bool {
+            !self.io.read_buffer().is_empty()
+        }
     }
 
     impl<Io> futures::Stream for MqttStream<Io>
@@ -534,6 +540,12 @@ pub mod v5 {
                 }
             };
             Ok(connect)
+        }
+
+        /// Returns whether bytes remain buffered after decoding CONNECT.
+        #[inline]
+        pub fn has_buffered_input(&self) -> bool {
+            !self.io.read_buffer().is_empty()
         }
     }
 

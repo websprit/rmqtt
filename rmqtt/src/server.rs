@@ -436,12 +436,16 @@ async fn listen_quic(scx: ServerContext, l: &Listener, lid: ListenerId) {
 
                     match stream {
                         MqttStream::V3(s) => {
-                            if let Err(e) = v3::process_quic(scx.clone(), s, activation, lid).await {
+                            if let Err(e) =
+                                v3::process_quic(scx.clone(), s, activation, meta.is_0rtt, lid).await
+                            {
                                 log::info!("MQTTv3/QUIC processing error: {e}");
                             }
                         }
                         MqttStream::V5(s) => {
-                            if let Err(e) = v5::process_quic(scx.clone(), s, activation, lid).await {
+                            if let Err(e) =
+                                v5::process_quic(scx.clone(), s, activation, meta.is_0rtt, lid).await
+                            {
                                 log::info!("MQTTv5/QUIC processing error: {e}");
                             }
                         }
@@ -449,6 +453,10 @@ async fn listen_quic(scx: ServerContext, l: &Listener, lid: ListenerId) {
                 });
             }
             Err(e) => {
+                if rmqtt_net::is_quic_admission_rejection(&e) {
+                    log::debug!("QUIC connection admission handled: {e}");
+                    continue;
+                }
                 log::info!("QUIC listener error: {e}");
                 tokio::time::sleep(Duration::from_millis(1000)).await;
             }

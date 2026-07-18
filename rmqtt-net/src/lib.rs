@@ -52,6 +52,8 @@ pub use quic_link::QuicMultiStreamLink;
 #[cfg(feature = "quic")]
 pub use quic_session_store::{ReplaySafeServerSessionStore, ZeroRttProfileFingerprint};
 
+#[cfg(feature = "quic")]
+pub use builder::is_quic_admission_rejection;
 /// Server configuration and listener management
 pub use builder::{Builder, Listener, ListenerType};
 

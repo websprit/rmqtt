@@ -77,6 +77,18 @@ pub type Result<T> = anyhow::Result<T, Error>;
 | `.proxy_protocol_timeout(d)` | `Duration` | `5s` |
 | `.idle_timeout(d)` | `Duration` | `90s` |
 | `.enable_quic_0rtt(v)` | `bool` | `false`；启用 Finished 栅栏保护的 CONNECT 传输和单次消费有状态 ticket，且不能与双向 TLS 同时启用 |
+| `.quic_0rtt_mode(s)` | `impl AsRef<str>` | `disabled` 或 `handshake_gated`；设置 early-data 准入模式 |
+| `.quic_0rtt_credential_profile(s)` | `impl AsRef<str>` | 恢复连接的凭据策略；启用 0-RTT 时不能为 `deny` |
+| `.quic_0rtt_auth_policy_epoch(n)` | `u64` | `0`；认证策略变更时使旧 ticket 失效 |
+| `.quic_0rtt_ticket_capacity(n)` | `usize` | `4096`；有状态单次消费 ticket 缓存容量 |
+| `.quic_0rtt_ticket_ttl(d)` | `Duration` | `600s`；ticket 缓存有效期 |
+| `.quic_0rtt_pre_finished_read_budget(n)` | `u32` | `64 KiB`；TLS Finished 前的传输层接收预算 |
+| `.multistream_mode(s)` | `impl Into<String>` | `disabled` 或 `simple`；启用 CONNACK 后的数据 Flow |
+| `.multistream_max_data_streams(n)` | `u32` | `8`；每连接额外 MQTT 数据 Flow 的最大数 |
+| `.multistream_stream_open_rate(n)` | `u32` | `32`；每个连接窗口允许打开的数据 Flow 数 |
+| `.multistream_stream_idle_timeout(d)` | `Duration` | `60s`；数据 Flow 空闲超时 |
+| `.multistream_connection_mailbox_packets(n)` | `usize` | `256`；每连接有界事件队列 |
+| `.multistream_connection_buffer_bytes(n)` | `usize` | `1 MiB`；每连接有界载荷缓冲 |
 | `.bind(self) -> Result<Listener>` | — | 绑定 TCP socket |
 | `.bind_quic(self) -> Result<Listener>` | — | `#[cfg(feature = "quic")]` |
 

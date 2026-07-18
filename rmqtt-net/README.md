@@ -77,6 +77,18 @@ All fields have `pub` visibility and fluent setter methods:
 | `.proxy_protocol_timeout(d)` | `Duration` | `5s` |
 | `.idle_timeout(d)` | `Duration` | `90s` |
 | `.enable_quic_0rtt(v)` | `bool` | `false`; enables handshake-gated CONNECT transport with single-use stateful tickets and is incompatible with mutual TLS |
+| `.quic_0rtt_mode(s)` | `impl AsRef<str>` | `disabled` or `handshake_gated`; sets the early-data admission mode |
+| `.quic_0rtt_credential_profile(s)` | `impl AsRef<str>` | Credential policy for resumed connections; must not be `deny` when 0-RTT is enabled |
+| `.quic_0rtt_auth_policy_epoch(n)` | `u64` | `0`; invalidates tickets when authentication policy changes |
+| `.quic_0rtt_ticket_capacity(n)` | `usize` | `4096`; capacity of the stateful, single-use ticket cache |
+| `.quic_0rtt_ticket_ttl(d)` | `Duration` | `600s`; ticket cache lifetime |
+| `.quic_0rtt_pre_finished_read_budget(n)` | `u32` | `64 KiB`; transport receive budget before TLS Finished |
+| `.multistream_mode(s)` | `impl Into<String>` | `disabled` or `simple`; enables post-CONNACK data flows |
+| `.multistream_max_data_streams(n)` | `u32` | `8`; maximum extra MQTT data flows per connection |
+| `.multistream_stream_open_rate(n)` | `u32` | `32`; data-flow opens allowed per connection window |
+| `.multistream_stream_idle_timeout(d)` | `Duration` | `60s`; idle timeout for a data flow |
+| `.multistream_connection_mailbox_packets(n)` | `usize` | `256`; bounded per-connection event queue |
+| `.multistream_connection_buffer_bytes(n)` | `usize` | `1 MiB`; bounded buffered payload per connection |
 | `.bind(self) -> Result<Listener>` | — | Binds TCP socket, returns Listener |
 | `.bind_quic(self) -> Result<Listener>` | — | `#[cfg(feature = "quic")]` QUIC bind |
 
