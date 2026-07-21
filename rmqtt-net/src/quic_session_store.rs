@@ -5,7 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use rustls::server::StoresServerSessions;
 
@@ -158,6 +158,166 @@ impl StoresServerSessions for ReplaySafeServerSessionStore {
     fn can_cache(&self) -> bool {
         true
     }
+}
+
+/// Synchronous, linearly consistent storage for session tickets shared by multiple nodes.
+///
+/// Implementations must make [`Self::take`] an atomic read-and-delete operation across the
+/// entire cluster. Returning an error is fail-closed: the TLS adapter treats it as a ticket miss
+/// and the client must retry with a 1-RTT handshake.
+pub trait ClusterTicketStore: Send + Sync + fmt::Debug {
+    /// Stores a ticket value until `expires_at`.
+    fn put(
+        &self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        expires_at: SystemTime,
+    ) -> Result<(), ClusterTicketStoreError>;
+
+    /// Loads a ticket without consuming it for non-0-RTT resumption paths.
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ClusterTicketStoreError>;
+
+    /// Atomically returns and consumes one ticket across all cluster members.
+    fn take(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ClusterTicketStoreError>;
+}
+
+/// Failure returned by a shared ticket backend.
+#[derive(Debug, thiserror::Error)]
+#[error("cluster ticket store is unavailable: {0}")]
+pub struct ClusterTicketStoreError(String);
+
+impl ClusterTicketStoreError {
+    /// Creates a backend failure with a non-sensitive diagnostic message.
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+/// TLS session store backed by a cluster-wide, linearly consistent ticket backend.
+///
+/// This is deliberately synchronous because rustls invokes [`StoresServerSessions`] from its
+/// handshake path. A backend must enforce a strict deadline and return an error rather than
+/// blocking indefinitely; errors become ticket misses and safely fall back to 1-RTT.
+pub struct ClusterReplaySafeServerSessionStore {
+    ttl: Duration,
+    profile: ZeroRttProfileFingerprint,
+    backend: Arc<dyn ClusterTicketStore>,
+}
+
+impl fmt::Debug for ClusterReplaySafeServerSessionStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClusterReplaySafeServerSessionStore")
+            .field("ttl", &self.ttl)
+            .field("profile", &self.profile)
+            .field("backend", &self.backend)
+            .finish()
+    }
+}
+
+impl ClusterReplaySafeServerSessionStore {
+    /// Creates a TLS session store that shares session contents and atomic ticket consumption.
+    pub fn new(
+        ttl: Duration,
+        profile: ZeroRttProfileFingerprint,
+        backend: Arc<dyn ClusterTicketStore>,
+    ) -> Arc<Self> {
+        Arc::new(Self { ttl, profile, backend })
+    }
+
+    fn wrapped_key(&self, key: &[u8]) -> Vec<u8> {
+        let mut wrapped = Vec::with_capacity(self.profile.0.len() + key.len());
+        wrapped.extend_from_slice(&self.profile.0);
+        wrapped.extend_from_slice(key);
+        wrapped
+    }
+
+    fn expires_at(&self) -> Option<SystemTime> {
+        SystemTime::now().checked_add(self.ttl)
+    }
+}
+
+impl StoresServerSessions for ClusterReplaySafeServerSessionStore {
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+        let Some(expires_at) = self.expires_at() else {
+            return false;
+        };
+        self.backend.put(self.wrapped_key(&key), value, expires_at).is_ok()
+    }
+
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.backend.get(&self.wrapped_key(key)).ok().flatten()
+    }
+
+    fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.backend.take(&self.wrapped_key(key)).ok().flatten()
+    }
+
+    fn can_cache(&self) -> bool {
+        true
+    }
+}
+
+/// In-process reference backend with linearizable semantics.
+///
+/// Production clusters must provide a backend shared by every process (for example a strongly
+/// consistent service with an atomic `take` command). This type is useful for tests and for a
+/// single process hosting several listeners.
+#[derive(Debug, Default)]
+pub struct InMemoryClusterTicketStore {
+    inner: Mutex<HashMap<Vec<u8>, ClusterEntry>>,
+}
+
+impl InMemoryClusterTicketStore {
+    /// Creates an empty shared-ticket backend.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+}
+
+impl ClusterTicketStore for InMemoryClusterTicketStore {
+    fn put(
+        &self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        expires_at: SystemTime,
+    ) -> Result<(), ClusterTicketStoreError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| ClusterTicketStoreError::unavailable("in-memory ticket store lock poisoned"))?;
+        purge_cluster_expired(&mut inner, SystemTime::now());
+        inner.insert(key, ClusterEntry { value, expires_at });
+        Ok(())
+    }
+
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ClusterTicketStoreError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| ClusterTicketStoreError::unavailable("in-memory ticket store lock poisoned"))?;
+        purge_cluster_expired(&mut inner, SystemTime::now());
+        Ok(inner.get(key).map(|entry| entry.value.clone()))
+    }
+
+    fn take(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ClusterTicketStoreError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| ClusterTicketStoreError::unavailable("in-memory ticket store lock poisoned"))?;
+        purge_cluster_expired(&mut inner, SystemTime::now());
+        Ok(inner.remove(key).map(|entry| entry.value))
+    }
+}
+
+#[derive(Debug)]
+struct ClusterEntry {
+    value: Vec<u8>,
+    expires_at: SystemTime,
+}
+
+fn purge_cluster_expired(entries: &mut HashMap<Vec<u8>, ClusterEntry>, now: SystemTime) {
+    entries.retain(|_, entry| entry.expires_at.duration_since(now).is_ok());
 }
 
 #[derive(Debug, Default)]
@@ -316,6 +476,31 @@ mod tests {
         assert_eq!(values.iter().filter(|value| value.is_some()).count(), 1);
         assert_eq!(values.into_iter().flatten().collect::<Vec<_>>(), vec![b"secret".to_vec()]);
         assert_eq!(store.take(b"ticket"), None);
+    }
+
+    #[test]
+    fn shared_backend_consumes_a_ticket_once_across_two_nodes() {
+        let backend = InMemoryClusterTicketStore::new();
+        let first =
+            ClusterReplaySafeServerSessionStore::new(Duration::from_secs(60), profile(1), backend.clone());
+        let second = ClusterReplaySafeServerSessionStore::new(Duration::from_secs(60), profile(1), backend);
+        assert!(first.put(b"ticket".to_vec(), b"secret".to_vec()));
+
+        let barrier = Arc::new(Barrier::new(2));
+        let first_barrier = barrier.clone();
+        let first_node = Arc::clone(&first);
+        let first_take = thread::spawn(move || {
+            first_barrier.wait();
+            first_node.take(b"ticket")
+        });
+        let second_take = thread::spawn(move || {
+            barrier.wait();
+            second.take(b"ticket")
+        });
+
+        let values = [first_take.join().unwrap(), second_take.join().unwrap()];
+        assert_eq!(values.iter().filter(|value| value.is_some()).count(), 1);
+        assert_eq!(values.into_iter().flatten().collect::<Vec<_>>(), vec![b"secret".to_vec()]);
     }
 
     #[test]

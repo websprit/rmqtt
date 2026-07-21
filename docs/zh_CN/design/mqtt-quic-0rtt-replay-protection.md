@@ -400,6 +400,12 @@ Broker 无法自动判断任意插件 token 是否真的“短期”；因此启
 2. 无法路由时安全退化到 1-RTT；
 3. 最后才评估低延迟、线性一致的共享 session store。
 
+### 9.3 可选的共享有状态 session
+
+对必须跨节点 0-RTT 的部署，`rmqtt-net` 提供 `ClusterTicketStore`。该方案共享的是 opaque rustls session value，而不是共享无状态 ticket 加密密钥。每个节点必须使用同一个 backend 与相同的 0-RTT profile，并通过 `Builder::quic_0rtt_cluster_ticket_store(...)` 配置 listener。
+
+backend 合同是同步的 `put/get/take`；其中 `take` 必须是全局线性一致的 read-and-delete。backend 错误刻意被当作 ticket miss：拒绝 0-RTT，退化为 1-RTT。随代码提供的 `InMemoryClusterTicketStore` 仅用于测试或同一进程内的多个 listener；生产环境必须实现共享、强一致、调用有界且使用认证传输的 backend。
+
 ## 10. 备选方案比较
 
 本设计并行评估了四种形态：

@@ -13,7 +13,7 @@ use tokio_util::codec::Framed;
 use rmqtt_codec::types::Protocol;
 use rmqtt_codec::v3::{Codec, Connect, ConnectAckReason, Packet};
 use rmqtt_codec::{MqttCodec, MqttPacket};
-use rmqtt_net::{tls_provider, Builder, MqttStream, QuinnBiStream, Result};
+use rmqtt_net::{tls_provider, Builder, InMemoryClusterTicketStore, MqttStream, QuinnBiStream, Result};
 
 #[tokio::test]
 async fn enabled_quic_listener_accepts_mqtt_data_in_zero_rtt() -> Result<()> {
@@ -66,6 +66,79 @@ async fn enabled_quic_listener_accepts_mqtt_data_in_zero_rtt() -> Result<()> {
     resumed.close(0_u32.into(), b"done");
 
     server.await??;
+    endpoint.wait_idle().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn shared_ticket_backend_allows_zero_rtt_on_a_second_listener() -> Result<()> {
+    let backend = InMemoryClusterTicketStore::new();
+    let build_listener = |name: &str| {
+        Builder::new()
+            .name(name)
+            .laddr("127.0.0.1:0".parse().expect("test socket address"))
+            .tls_cert(Some(test_certificate_path().to_string_lossy()))
+            .tls_key(Some(test_private_key_path().to_string_lossy()))
+            .enable_quic_0rtt(true)
+            .quic_0rtt_credential_profile("anonymous")
+            .quic_0rtt_cluster_ticket_store(backend.clone())
+            .bind_quic()
+            .expect("shared-ticket QUIC listener")
+    };
+    let first_listener = build_listener("shared-ticket-first");
+    let second_listener = build_listener("shared-ticket-second");
+    let first_addr = first_listener.local_addr()?;
+    let second_addr = second_listener.local_addr()?;
+
+    let first_server = tokio::spawn(async move {
+        let accepted = first_listener.next_quic().await?.accept_control().await?;
+        assert!(!accepted.meta().is_0rtt);
+        let (stream, _, _) = accepted.mqtt().await?.into_parts();
+        let MqttStream::V3(mut stream) = stream else {
+            panic!("expected MQTT v3 stream");
+        };
+        let _ = stream.recv_connect(Duration::from_secs(1)).await?;
+        stream.send_connect_ack(ConnectAckReason::ConnectionAccepted, false).await?;
+        stream.flush().await?;
+        let _ = stream.next().await;
+        Result::<()>::Ok(())
+    });
+
+    let mut endpoint = Endpoint::client("127.0.0.1:0".parse()?)?;
+    endpoint.set_default_client_config(test_client_config()?);
+    let first = endpoint.connect(first_addr, "localhost")?.await?;
+    exchange_connect(&first, "shared-ticket").await?;
+    first.close(0_u32.into(), b"ticket issued");
+    first_server.await??;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let second_server = tokio::spawn(async move {
+        let accepted = second_listener.next_quic().await?.accept_control().await?;
+        if !accepted.meta().is_0rtt {
+            return Err(anyhow::anyhow!("listener B did not accept the connection as 0-RTT"));
+        }
+        let (stream, _, _) = accepted.mqtt().await?.into_parts();
+        let MqttStream::V3(mut stream) = stream else {
+            panic!("expected MQTT v3 stream");
+        };
+        let _ = stream.recv_connect(Duration::from_secs(1)).await?;
+        stream.send_connect_ack(ConnectAckReason::ConnectionAccepted, false).await?;
+        stream.flush().await?;
+        let _ = stream.next().await;
+        Result::<()>::Ok(())
+    });
+
+    let connecting = endpoint.connect(second_addr, "localhost")?;
+    let (second, accepted) = connecting.into_0rtt().expect("shared ticket must permit 0-RTT on listener B");
+    if let Err(error) = exchange_connect(&second, "shared-ticket").await {
+        let server_result = second_server.await;
+        return Err(anyhow::anyhow!(
+            "shared-ticket client failed: {error:#}; server result: {server_result:?}"
+        ));
+    }
+    assert!(accepted.await, "listener B must accept the shared 0-RTT ticket");
+    second.close(0_u32.into(), b"done");
+    second_server.await??;
     endpoint.wait_idle().await;
     Ok(())
 }
@@ -343,7 +416,7 @@ async fn exchange_connect(connection: &Connection, client_id: &str) -> Result<()
 
     let response = framed.next().await;
     let Some(Ok((MqttPacket::V3(Packet::ConnectAck(ack)), _))) = response else {
-        panic!("expected MQTT CONNACK for {client_id}, got {response:?}");
+        return Err(anyhow::anyhow!("expected MQTT CONNACK for {client_id}, got {response:?}"));
     };
     assert_eq!(ack.return_code, ConnectAckReason::ConnectionAccepted);
     framed.close().await?;

@@ -50,7 +50,10 @@ pub use quic::{
 #[cfg(feature = "quic")]
 pub use quic_link::QuicMultiStreamLink;
 #[cfg(feature = "quic")]
-pub use quic_session_store::{ReplaySafeServerSessionStore, ZeroRttProfileFingerprint};
+pub use quic_session_store::{
+    ClusterReplaySafeServerSessionStore, ClusterTicketStore, ClusterTicketStoreError,
+    InMemoryClusterTicketStore, ReplaySafeServerSessionStore, ZeroRttProfileFingerprint,
+};
 
 #[cfg(feature = "quic")]
 pub use builder::is_quic_admission_rejection;

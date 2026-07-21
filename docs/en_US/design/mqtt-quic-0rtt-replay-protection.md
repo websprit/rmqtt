@@ -400,6 +400,12 @@ Also note that rustls `StoresServerSessions` is a synchronous interface. Putting
 2. safe fallback to 1-RTT when routing is not possible;
 3. only then evaluate a low-latency, linearly consistent shared session store.
 
+### 9.3 Opt-in Shared Stateful Sessions
+
+`rmqtt-net` exposes `ClusterTicketStore` for deployments that require cross-node 0-RTT. It stores the opaque rustls session value, rather than sharing a stateless ticket-encryption key. Every node must use the same backend and 0-RTT profile, then configure its listener with `Builder::quic_0rtt_cluster_ticket_store(...)`.
+
+The backend contract is synchronous `put/get/take`; `take` is a cluster-wide linearizable read-and-delete. Backend errors are deliberately treated as ticket misses, which rejects 0-RTT and falls back to 1-RTT. The included `InMemoryClusterTicketStore` is only a reference backend for tests or multiple listeners in one process; production requires a shared strongly consistent implementation with bounded calls and authenticated transport.
+
 ## 10. Alternative Comparison
 
 This design evaluated four shapes in parallel:

@@ -46,7 +46,10 @@ use std::time::Instant;
 #[cfg(feature = "quic")]
 use crate::quic::{QuicIncoming, QuinnBiStream};
 #[cfg(feature = "quic")]
-use crate::quic_session_store::{ReplaySafeServerSessionStore, ZeroRttProfileFingerprint};
+use crate::quic_session_store::{
+    ClusterReplaySafeServerSessionStore, ClusterTicketStore, ReplaySafeServerSessionStore,
+    ZeroRttProfileFingerprint,
+};
 use crate::stream::Dispatcher;
 #[cfg(feature = "ws")]
 use crate::ws::WsStream;
@@ -259,6 +262,9 @@ pub struct Builder {
     pub quic_0rtt_ticket_capacity: usize,
     /// Time-to-live for cached QUIC 0-RTT tickets.
     pub quic_0rtt_ticket_ttl: Duration,
+    /// Optional shared, linearly consistent ticket backend for cross-node 0-RTT resumption.
+    #[cfg(feature = "quic")]
+    pub quic_0rtt_cluster_ticket_store: Option<Arc<dyn ClusterTicketStore>>,
     /// Bytes accepted before the resumed QUIC handshake finishes.
     pub quic_0rtt_pre_finished_read_budget: u32,
     /// QUIC multistream mode string, currently `disabled` or `simple`.
@@ -349,6 +355,8 @@ impl Builder {
             quic_0rtt_auth_policy_epoch: 0,
             quic_0rtt_ticket_capacity: 4096,
             quic_0rtt_ticket_ttl: Duration::from_secs(10 * 60),
+            #[cfg(feature = "quic")]
+            quic_0rtt_cluster_ticket_store: None,
             quic_0rtt_pre_finished_read_budget: 64 * 1024,
             multistream_mode: "disabled".into(),
             multistream_negotiation: "strict".into(),
@@ -646,6 +654,16 @@ impl Builder {
         self
     }
 
+    /// Shares stateful TLS session contents and atomic ticket consumption across nodes.
+    ///
+    /// The backend must provide a cluster-wide, linearly consistent `take`; backend failures
+    /// are handled as ticket misses so 0-RTT fails closed and the client falls back to 1-RTT.
+    #[cfg(feature = "quic")]
+    pub fn quic_0rtt_cluster_ticket_store(mut self, backend: Arc<dyn ClusterTicketStore>) -> Self {
+        self.quic_0rtt_cluster_ticket_store = Some(backend);
+        self
+    }
+
     /// Configures bytes accepted before the resumed QUIC handshake finishes.
     pub fn quic_0rtt_pre_finished_read_budget(mut self, pre_finished_read_budget: u32) -> Self {
         self.quic_0rtt_pre_finished_read_budget = pre_finished_read_budget;
@@ -788,11 +806,18 @@ impl Builder {
                 )
                 .as_str(),
             );
-            tls_config.session_storage = ReplaySafeServerSessionStore::new(
-                self.quic_0rtt_ticket_capacity,
-                self.quic_0rtt_ticket_ttl,
-                profile,
-            );
+            tls_config.session_storage = match &self.quic_0rtt_cluster_ticket_store {
+                Some(backend) => ClusterReplaySafeServerSessionStore::new(
+                    self.quic_0rtt_ticket_ttl,
+                    profile,
+                    backend.clone(),
+                ),
+                None => ReplaySafeServerSessionStore::new(
+                    self.quic_0rtt_ticket_capacity,
+                    self.quic_0rtt_ticket_ttl,
+                    profile,
+                ),
+            };
             // Quinn requires QUIC max early data to be either 0 or 2^32-1.
             tls_config.max_early_data_size = u32::MAX;
         }
@@ -1512,5 +1537,14 @@ mod tests {
         assert_eq!(builder.quic_0rtt_ticket_capacity, 128);
         assert_eq!(builder.quic_0rtt_ticket_ttl, Duration::from_secs(30));
         assert_eq!(builder.quic_0rtt_pre_finished_read_budget, 32 * 1024);
+    }
+
+    #[cfg(feature = "quic")]
+    #[test]
+    fn builder_accepts_a_shared_cluster_ticket_backend() {
+        let backend = crate::InMemoryClusterTicketStore::new();
+        let builder = Builder::new().quic_0rtt_cluster_ticket_store(backend);
+
+        assert!(builder.quic_0rtt_cluster_ticket_store.is_some());
     }
 }
